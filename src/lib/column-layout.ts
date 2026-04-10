@@ -8,43 +8,48 @@ interface ColumnLayoutResult {
 interface LayoutMetrics {
   averageHeight: number;
   averageWidth: number;
+  medianHeight: number;
   verticalThreshold: number;
   horizontalThreshold: number;
 }
 
-interface LayoutBlock {
-  bbox: OcrBoundingBox;
-  tokens: OcrToken[];
-  text: string;
-  layoutRole: OcrLayoutRole;
-  vGap: number;
-  hGap: number;
-  trackIndex: number | null;
-  spansSeparator: boolean;
+/**
+ * A horizontal band across the page where column structure is consistent.
+ * Full-width headings occupy their own band; multi-column body is another.
+ */
+interface HorizontalBand {
+  yStart: number;
+  yEnd: number;
+  lines: OcrToken[][];
 }
 
-interface LineSegment {
-  bbox: OcrBoundingBox;
-  tokens: OcrToken[];
-  lineIndex: number;
-}
-
-interface ColumnSeparator {
+/**
+ * A vertical column region within a band (the actual spatial lane on the page).
+ */
+interface ColumnRegion {
   left: number;
   right: number;
-  coverageHeight: number;
-  rowCount: number;
-}
-
-interface RegionBand {
   index: number;
-  bbox: OcrBoundingBox;
-  left: number;
-  right: number;
 }
 
-const MIN_COLUMN_TOKENS = 3;
-const MIN_COLUMN_SHARE = 0.18;
+/**
+ * A reading group: contiguous block of tokens that should be read as a unit.
+ */
+interface ReadingGroup {
+  tokens: OcrToken[];
+  bbox: OcrBoundingBox;
+  layoutRole: OcrLayoutRole;
+  bandIndex: number;
+  columnIndex: number;
+}
+
+const MIN_GUTTER_LINES_RATIO = 0.35;
+const MIN_GUTTER_WIDTH_FACTOR = 1.5;
+const HEADING_MAX_LINES = 2;
+const HEADING_MAX_WORDS = 14;
+const HEADING_MAX_WIDTH_RATIO = 0.75;
+
+// ─── Public API ───────────────────────────────────────────────────────────────
 
 export function buildColumnLayout(tokens: OcrToken[]): ColumnLayoutResult {
   const normalizedTokens = tokens
@@ -56,10 +61,17 @@ export function buildColumnLayout(tokens: OcrToken[]): ColumnLayoutResult {
   }
 
   const metrics = computeLayoutMetrics(normalizedTokens);
-  const blocks = buildLayoutBlocks(normalizedTokens, metrics);
-  const groups = buildReadingGroups(blocks, metrics);
+  const lines = groupTokensIntoLines(normalizedTokens);
+  const pageBounds = getBounds(normalizedTokens);
 
-  const columns = groups
+  // Step 1: Segment into horizontal bands (heading bands vs body bands)
+  const bands = segmentIntoBands(lines, metrics, pageBounds);
+
+  // Step 2: For each band, detect columns and assign tokens
+  const readingGroups = extractReadingGroups(bands, metrics, pageBounds);
+
+  // Step 3: Build OcrColumn per group, in reading order
+  const columns = readingGroups
     .map((group, index) => buildColumn(group.tokens, index + 1, group.layoutRole))
     .filter((column): column is OcrColumn => column !== null);
 
@@ -96,378 +108,337 @@ export function buildColumn(
   };
 }
 
+// ─── Layout Metrics ───────────────────────────────────────────────────────────
+
 function computeLayoutMetrics(tokens: OcrToken[]): LayoutMetrics {
   const heights = tokens.map((token) => token.bbox.height).sort((a, b) => a - b);
   const widths = tokens.map((token) => token.bbox.width).sort((a, b) => a - b);
-  const averageHeight = heights[Math.floor(heights.length / 2)] ?? 12;
+  const medianHeight = heights[Math.floor(heights.length / 2)] ?? 12;
+  const averageHeight = medianHeight;
   const averageWidth = widths[Math.floor(widths.length / 2)] ?? 24;
 
   return {
     averageHeight,
     averageWidth,
+    medianHeight,
     verticalThreshold: Math.max(10, averageHeight * 1.5),
-    horizontalThreshold: Math.max(24, averageWidth * 1.8),
+    horizontalThreshold: Math.max(24, averageWidth * MIN_GUTTER_WIDTH_FACTOR),
   };
 }
 
-function buildLayoutBlocks(tokens: OcrToken[], metrics: LayoutMetrics): LayoutBlock[] {
-  const lines = groupTokensIntoLines(tokens);
-  if (lines.length === 0) {
-    return [];
-  }
+// ─── Band Segmentation ───────────────────────────────────────────────────────
 
-  const pageBounds = getBounds(lines.flat());
-  const segments = lines.flatMap((line, lineIndex) =>
-    splitLineIntoSegments(line, metrics).map((tokens) => ({
-      tokens,
-      bbox: getBounds(tokens),
-      lineIndex,
-    }))
-  );
-  const separators = detectStableSeparators(lines, metrics, pageBounds);
-  const regions = buildRegionBands(pageBounds, separators, metrics);
-  const rawBlocks = buildBlocksFromSegments(segments, separators, regions, metrics);
-  const populatedTrackCount = new Set(
-    rawBlocks
-      .map((block) => block.trackIndex)
-      .filter((trackIndex): trackIndex is number => trackIndex !== null)
-  ).size;
-
-  return rawBlocks.map((block) => {
-    const { vGap, hGap } = measureBlockGaps(block, rawBlocks, metrics);
-    return {
-      ...block,
-      vGap,
-      hGap,
-      layoutRole: classifyLayoutRole(
-        block,
-        rawBlocks,
-        metrics,
-        vGap,
-        hGap,
-        regions,
-        populatedTrackCount
-      ),
-    };
-  });
-}
-
-function splitLineIntoSegments(tokens: OcrToken[], metrics: LayoutMetrics): OcrToken[][] {
-  const sorted = [...tokens].sort((a, b) => a.bbox.x - b.bbox.x);
-  if (sorted.length === 0) {
-    return [];
-  }
-
-  const segments: OcrToken[][] = [[sorted[0]]];
-  let previousRight = sorted[0].bbox.x + sorted[0].bbox.width;
-
-  for (let index = 1; index < sorted.length; index += 1) {
-    const token = sorted[index];
-    const gap = token.bbox.x - previousRight;
-
-    if (gap > metrics.horizontalThreshold) {
-      segments.push([token]);
-    } else {
-      segments[segments.length - 1].push(token);
-    }
-
-    previousRight = Math.max(previousRight, token.bbox.x + token.bbox.width);
-  }
-
-  return segments;
-}
-
-function measureBlockGaps(
-  block: LayoutBlock,
-  blocks: LayoutBlock[],
-  metrics: LayoutMetrics
-): { vGap: number; hGap: number } {
-  let vGap = Number.POSITIVE_INFINITY;
-  let hGap = Number.POSITIVE_INFINITY;
-
-  for (const candidate of blocks) {
-    if (candidate === block) continue;
-
-    const verticalDistance = verticalGapBetween(block.bbox, candidate.bbox);
-    const horizontalDistance = horizontalGapBetween(block.bbox, candidate.bbox);
-
-    if (
-      horizontalOverlapRatio(block.bbox, candidate.bbox) >= 0.18 ||
-      horizontalDistance < metrics.horizontalThreshold
-    ) {
-      vGap = Math.min(vGap, verticalDistance);
-    }
-
-    if (
-      verticalOverlapRatio(block.bbox, candidate.bbox) >= 0.18 ||
-      verticalDistance < metrics.verticalThreshold
-    ) {
-      hGap = Math.min(hGap, horizontalDistance);
-    }
-  }
-
-  return {
-    vGap: Number.isFinite(vGap) ? vGap : 0,
-    hGap: Number.isFinite(hGap) ? hGap : 0,
-  };
-}
-
-function classifyLayoutRole(
-  block: LayoutBlock,
-  blocks: LayoutBlock[],
-  metrics: LayoutMetrics,
-  vGap: number,
-  hGap: number,
-  regions: RegionBand[],
-  populatedTrackCount: number
-): OcrLayoutRole {
-  if (vGap > metrics.verticalThreshold && looksLikeHeading(block, blocks)) {
-    return 'heading';
-  }
-
-  if (block.trackIndex !== null && populatedTrackCount > 1) {
-    const region = regions.find((entry) => entry.index === block.trackIndex);
-    const widestRegion = Math.max(...regions.map((entry) => entry.right - entry.left), 1);
-
-    if (region && region.right - region.left <= widestRegion) {
-      return 'side';
-    }
-  }
-
-  if (vGap > metrics.verticalThreshold && hGap < metrics.horizontalThreshold) {
-    return 'column';
-  }
-
-  if (hGap > metrics.horizontalThreshold && vGap < metrics.verticalThreshold) {
-    return 'side';
-  }
-
-  return 'flow';
-}
-
-function looksLikeHeading(block: LayoutBlock, blocks: LayoutBlock[]): boolean {
-  const lineCount = block.text.split('\n').length;
-  const wordCount = block.text.split(/\s+/).filter(Boolean).length;
-  const pageBounds = getBounds(blocks.flatMap((entry) => entry.tokens));
-  const widthRatio = block.bbox.width / Math.max(pageBounds.width, 1);
-  const pageCenter = pageBounds.x + pageBounds.width / 2;
-  const blockCenter = block.bbox.x + block.bbox.width / 2;
-  const centered = Math.abs(blockCenter - pageCenter) <= pageBounds.width * 0.2;
-
-  return lineCount <= 2 && wordCount <= 12 && widthRatio < 0.7 && centered;
-}
-
-function buildReadingGroups(blocks: LayoutBlock[], metrics: LayoutMetrics): LayoutBlock[] {
-  return [...blocks].sort((a, b) => a.bbox.y - b.bbox.y || a.bbox.x - b.bbox.x);
-}
-
-function detectStableSeparators(
+/**
+ * Splits the page into horizontal bands. Lines that span the full width
+ * (or nearly so) with few words are treated as heading bands; contiguous
+ * non-heading lines form body bands.
+ */
+function segmentIntoBands(
   lines: OcrToken[][],
   metrics: LayoutMetrics,
   pageBounds: OcrBoundingBox
-): ColumnSeparator[] {
-  const candidates: ColumnSeparator[] = [];
+): HorizontalBand[] {
+  if (lines.length === 0) return [];
+
+  const bands: HorizontalBand[] = [];
+  let currentLines: OcrToken[][] = [];
+  let currentIsHeading: boolean | null = null;
 
   for (const line of lines) {
-    const segments = splitLineIntoSegments(line, metrics);
-    if (segments.length < 2) continue;
+    const isHeading = isHeadingLine(line, lines, metrics, pageBounds);
 
-    const lineBounds = getBounds(line);
+    if (currentIsHeading !== null && isHeading !== currentIsHeading) {
+      // Flush the current band
+      bands.push(makeBand(currentLines));
+      currentLines = [];
+    }
 
-    for (let index = 1; index < segments.length; index += 1) {
-      const previous = getBounds(segments[index - 1]);
-      const current = getBounds(segments[index]);
-      const left = previous.x + previous.width;
-      const right = current.x;
-      const width = right - left;
+    currentLines.push(line);
+    currentIsHeading = isHeading;
+  }
 
-      if (width < metrics.horizontalThreshold) {
-        continue;
-      }
+  if (currentLines.length > 0) {
+    bands.push(makeBand(currentLines));
+  }
 
-      const existing = candidates.find((candidate) =>
-        Math.abs(separatorCenter(candidate) - (left + right) / 2) <= metrics.horizontalThreshold
-      );
+  return bands;
+}
 
-      if (existing) {
-        existing.left = (existing.left * existing.rowCount + left) / (existing.rowCount + 1);
-        existing.right = (existing.right * existing.rowCount + right) / (existing.rowCount + 1);
-        existing.coverageHeight += lineBounds.height;
-        existing.rowCount += 1;
-      } else {
+function makeBand(lines: OcrToken[][]): HorizontalBand {
+  const allTokens = lines.flat();
+  const bounds = getBounds(allTokens);
+  return {
+    yStart: bounds.y,
+    yEnd: bounds.y + bounds.height,
+    lines,
+  };
+}
+
+/**
+ * A line is considered a heading if it's short (few words), isolated vertically,
+ * and roughly centered or significantly narrower than body content.
+ */
+function isHeadingLine(
+  line: OcrToken[],
+  allLines: OcrToken[][],
+  metrics: LayoutMetrics,
+  pageBounds: OcrBoundingBox
+): boolean {
+  const bounds = getBounds(line);
+  const wordCount = line.reduce((count, token) => {
+    return count + token.text.split(/\s+/).filter(Boolean).length;
+  }, 0);
+
+  if (wordCount > HEADING_MAX_WORDS) return false;
+
+  const widthRatio = bounds.width / Math.max(pageBounds.width, 1);
+  if (widthRatio >= HEADING_MAX_WIDTH_RATIO) return false;
+
+  // Check vertical gap from nearest line
+  const lineBounds = getBounds(line);
+  const centerY = lineBounds.y + lineBounds.height / 2;
+  let minGap = Infinity;
+
+  for (const otherLine of allLines) {
+    if (otherLine === line) continue;
+    const otherBounds = getBounds(otherLine);
+    const gap = verticalGapBetween(lineBounds, otherBounds);
+    minGap = Math.min(minGap, gap);
+  }
+
+  // Must have significant vertical gap to qualify as heading
+  return minGap > metrics.verticalThreshold;
+}
+
+// ─── Column Detection via Projection ──────────────────────────────────────────
+
+/**
+ * Detects vertical column boundaries within a set of lines using gap analysis.
+ * Returns the column regions if multi-column layout is detected.
+ */
+function detectColumnsInLines(
+  lines: OcrToken[][],
+  metrics: LayoutMetrics,
+  pageBounds: OcrBoundingBox
+): ColumnRegion[] {
+  if (lines.length < 2) return [];
+
+  // Collect all inter-segment gaps across all lines
+  const gutterCandidates = collectGutterCandidates(lines, metrics);
+  if (gutterCandidates.length === 0) return [];
+
+  // Cluster gutter candidates by their horizontal position
+  const gutters = clusterGutters(gutterCandidates, metrics);
+
+  // Filter to stable gutters that appear in enough lines
+  const stableGutters = gutters.filter(
+    (g) => g.lineCount / lines.length >= MIN_GUTTER_LINES_RATIO && g.lineCount >= 2
+  );
+
+  if (stableGutters.length === 0) return [];
+
+  // Build column regions from the stable gutters
+  return buildColumnRegions(stableGutters, pageBounds);
+}
+
+interface GutterCandidate {
+  left: number;
+  right: number;
+  centerX: number;
+}
+
+interface GutterCluster {
+  left: number;
+  right: number;
+  centerX: number;
+  lineCount: number;
+}
+
+function collectGutterCandidates(
+  lines: OcrToken[][],
+  metrics: LayoutMetrics
+): GutterCandidate[] {
+  const candidates: GutterCandidate[] = [];
+
+  for (const line of lines) {
+    const sorted = [...line].sort((a, b) => a.bbox.x - b.bbox.x);
+    if (sorted.length < 2) continue;
+
+    // Walk through tokens looking for large horizontal gaps
+    for (let i = 1; i < sorted.length; i++) {
+      const prevRight = sorted[i - 1].bbox.x + sorted[i - 1].bbox.width;
+      const currLeft = sorted[i].bbox.x;
+      const gap = currLeft - prevRight;
+
+      if (gap >= metrics.horizontalThreshold) {
         candidates.push({
-          left,
-          right,
-          coverageHeight: lineBounds.height,
-          rowCount: 1,
+          left: prevRight,
+          right: currLeft,
+          centerX: (prevRight + currLeft) / 2,
         });
       }
     }
   }
 
-  const stable = candidates
-    .filter((candidate) => {
-      const coverageRatio = candidate.coverageHeight / Math.max(pageBounds.height, 1);
-      const rowShare = candidate.rowCount / Math.max(lines.length, 1);
-      const width = candidate.right - candidate.left;
-
-      return (
-        (coverageRatio >= 0.35 || rowShare >= 0.45) &&
-        width >= metrics.horizontalThreshold * 0.9 &&
-        candidate.rowCount >= 2
-      );
-    })
-    .sort((a, b) => a.left - b.left);
-
-  return mergeSeparators(stable, metrics);
+  return candidates;
 }
 
-function mergeSeparators(
-  separators: ColumnSeparator[],
+function clusterGutters(
+  candidates: GutterCandidate[],
   metrics: LayoutMetrics
-): ColumnSeparator[] {
-  if (separators.length <= 1) {
-    return separators;
-  }
+): GutterCluster[] {
+  if (candidates.length === 0) return [];
 
-  const merged: ColumnSeparator[] = [separators[0]];
+  const sorted = [...candidates].sort((a, b) => a.centerX - b.centerX);
+  const clusters: GutterCluster[] = [];
 
-  for (let index = 1; index < separators.length; index += 1) {
-    const previous = merged[merged.length - 1];
-    const current = separators[index];
+  for (const candidate of sorted) {
+    const matching = clusters.find(
+      (c) => Math.abs(c.centerX - candidate.centerX) <= metrics.horizontalThreshold
+    );
 
-    if (current.left - previous.right <= metrics.averageWidth) {
-      const totalRows = previous.rowCount + current.rowCount;
-      previous.left = (previous.left * previous.rowCount + current.left * current.rowCount) / totalRows;
-      previous.right = (previous.right * previous.rowCount + current.right * current.rowCount) / totalRows;
-      previous.coverageHeight = Math.max(previous.coverageHeight, current.coverageHeight);
-      previous.rowCount = totalRows;
+    if (matching) {
+      // Weighted average to refine position
+      const newCount = matching.lineCount + 1;
+      matching.left =
+        (matching.left * matching.lineCount + candidate.left) / newCount;
+      matching.right =
+        (matching.right * matching.lineCount + candidate.right) / newCount;
+      matching.centerX =
+        (matching.centerX * matching.lineCount + candidate.centerX) / newCount;
+      matching.lineCount = newCount;
     } else {
-      merged.push({ ...current });
+      clusters.push({
+        left: candidate.left,
+        right: candidate.right,
+        centerX: candidate.centerX,
+        lineCount: 1,
+      });
     }
   }
 
-  return merged;
+  return clusters;
 }
 
-function buildRegionBands(
-  pageBounds: OcrBoundingBox,
-  separators: ColumnSeparator[],
-  metrics: LayoutMetrics
-): RegionBand[] {
-  const regions: RegionBand[] = [];
+function buildColumnRegions(
+  gutters: GutterCluster[],
+  pageBounds: OcrBoundingBox
+): ColumnRegion[] {
+  const sorted = [...gutters].sort((a, b) => a.centerX - b.centerX);
+  const regions: ColumnRegion[] = [];
   let cursor = pageBounds.x;
-  let index = 0;
 
-  for (const separator of separators) {
-    if (separator.left - cursor >= metrics.averageWidth * 0.8) {
+  for (let i = 0; i < sorted.length; i++) {
+    const gutter = sorted[i];
+    if (gutter.left > cursor) {
       regions.push({
-        index,
         left: cursor,
-        right: separator.left,
-        bbox: {
-          x: cursor,
-          y: pageBounds.y,
-          width: separator.left - cursor,
-          height: pageBounds.height,
-        },
+        right: gutter.left,
+        index: regions.length,
       });
-      index += 1;
     }
-
-    cursor = separator.right;
+    cursor = gutter.right;
   }
 
+  // Last region (right of rightmost gutter)
   const pageRight = pageBounds.x + pageBounds.width;
-  if (pageRight - cursor >= metrics.averageWidth * 0.8) {
+  if (pageRight > cursor) {
     regions.push({
-      index,
       left: cursor,
       right: pageRight,
-      bbox: {
-        x: cursor,
-        y: pageBounds.y,
-        width: pageRight - cursor,
-        height: pageBounds.height,
-      },
+      index: regions.length,
     });
   }
 
-  return regions;
+  return regions.length >= 2 ? regions : [];
 }
 
-function buildBlocksFromSegments(
-  segments: LineSegment[],
-  separators: ColumnSeparator[],
-  regions: RegionBand[],
-  metrics: LayoutMetrics
-): LayoutBlock[] {
-  const sorted = [...segments].sort((a, b) => a.bbox.y - b.bbox.y || a.bbox.x - b.bbox.x);
-  const blocks: LayoutBlock[] = [];
-  const lastByTrack = new Map<number, LayoutBlock>();
-  let lastSpanning: LayoutBlock | null = null;
+// ─── Reading Group Extraction ─────────────────────────────────────────────────
 
-  for (const segment of sorted) {
-    const trackIndex = assignSegmentTrack(segment, separators, regions, metrics);
-    const spansSeparator = overlapsAnySeparator(segment.bbox, separators);
-    const candidate = createSegmentBlock(segment, trackIndex, spansSeparator);
+/**
+ * For each band, detect columns and produce reading groups.
+ * Reading order: within each band, read each column fully top-to-bottom,
+ * left-to-right.
+ */
+function extractReadingGroups(
+  bands: HorizontalBand[],
+  metrics: LayoutMetrics,
+  pageBounds: OcrBoundingBox
+): ReadingGroup[] {
+  const groups: ReadingGroup[] = [];
 
-    if (trackIndex !== null) {
-      const previous = lastByTrack.get(trackIndex);
-      if (previous && shouldMergeIntoTrack(previous, candidate, metrics)) {
-        Object.assign(previous, mergeBlocks([previous, candidate], previous.layoutRole));
-      } else {
-        blocks.push(candidate);
-        lastByTrack.set(trackIndex, candidate);
-      }
-      lastSpanning = null;
-      continue;
-    }
+  for (let bandIndex = 0; bandIndex < bands.length; bandIndex++) {
+    const band = bands[bandIndex];
+    const bandTokens = band.lines.flat();
+    if (bandTokens.length === 0) continue;
 
-    if (lastSpanning && shouldMergeSpanningBlocks(lastSpanning, candidate, metrics)) {
-      Object.assign(lastSpanning, mergeBlocks([lastSpanning, candidate], lastSpanning.layoutRole));
+    const bandBounds = getBounds(bandTokens);
+
+    // Detect columns within this band
+    const columnRegions = detectColumnsInLines(band.lines, metrics, pageBounds);
+
+    if (columnRegions.length < 2) {
+      // Single-column band (heading or single-column body)
+      const isHeading =
+        band.lines.length <= HEADING_MAX_LINES &&
+        isHeadingLine(band.lines[0], bands.flatMap((b) => b.lines), metrics, pageBounds);
+
+      groups.push({
+        tokens: bandTokens,
+        bbox: bandBounds,
+        layoutRole: isHeading ? 'heading' : 'flow',
+        bandIndex,
+        columnIndex: 0,
+      });
     } else {
-      blocks.push(candidate);
-      lastSpanning = candidate;
+      // Multi-column band: assign each token to its best-matching column
+      const columnTokens: Map<number, OcrToken[]> = new Map();
+      for (const region of columnRegions) {
+        columnTokens.set(region.index, []);
+      }
+
+      for (const token of bandTokens) {
+        const bestRegion = findBestColumnRegion(token, columnRegions);
+        if (bestRegion !== null) {
+          columnTokens.get(bestRegion.index)!.push(token);
+        }
+      }
+
+      // Produce groups in column order (left to right), each read top-to-bottom
+      for (const region of columnRegions) {
+        const tokens = columnTokens.get(region.index) ?? [];
+        if (tokens.length === 0) continue;
+
+        groups.push({
+          tokens,
+          bbox: getBounds(tokens),
+          layoutRole: 'side',
+          bandIndex,
+          columnIndex: region.index,
+        });
+      }
     }
   }
 
-  return blocks;
+  return groups;
 }
 
-function createSegmentBlock(
-  segment: LineSegment,
-  trackIndex: number | null,
-  spansSeparator: boolean
-): LayoutBlock {
-  return {
-    bbox: segment.bbox,
-    tokens: segment.tokens,
-    text: tokensToText(segment.tokens),
-    layoutRole: 'flow',
-    vGap: 0,
-    hGap: 0,
-    trackIndex,
-    spansSeparator,
-  };
-}
-
-function assignSegmentTrack(
-  segment: LineSegment,
-  separators: ColumnSeparator[],
-  regions: RegionBand[],
-  metrics: LayoutMetrics
-): number | null {
-  if (regions.length === 0 || overlapsAnySeparator(segment.bbox, separators)) {
-    return null;
-  }
-
-  let bestRegion: RegionBand | null = null;
+/**
+ * Assigns a token to the column region it overlaps with the most.
+ */
+function findBestColumnRegion(
+  token: OcrToken,
+  regions: ColumnRegion[]
+): ColumnRegion | null {
+  let bestRegion: ColumnRegion | null = null;
   let bestOverlap = 0;
 
   for (const region of regions) {
-    const overlap = overlapWidth(segment.bbox, region.bbox);
-    const ratio = overlap / Math.max(segment.bbox.width, 1);
+    const overlap = overlapWidth(
+      token.bbox,
+      { x: region.left, y: 0, width: region.right - region.left, height: 1 }
+    );
+    const ratio = overlap / Math.max(token.bbox.width, 1);
 
     if (ratio > bestOverlap) {
       bestOverlap = ratio;
@@ -475,72 +446,10 @@ function assignSegmentTrack(
     }
   }
 
-  return bestRegion && bestOverlap >= 0.65 ? bestRegion.index : null;
+  return bestRegion;
 }
 
-function overlapsAnySeparator(
-  bbox: OcrBoundingBox,
-  separators: ColumnSeparator[]
-): boolean {
-  return separators.some((separator) => overlapX(bbox, separator.left, separator.right) > 0);
-}
-
-function shouldMergeIntoTrack(
-  current: LayoutBlock,
-  next: LayoutBlock,
-  metrics: LayoutMetrics
-): boolean {
-  const vGap = verticalGapBetween(current.bbox, next.bbox);
-  const overlap = horizontalOverlapRatio(current.bbox, next.bbox);
-
-  return vGap <= metrics.verticalThreshold * 1.5 && overlap >= 0.18;
-}
-
-function shouldMergeSpanningBlocks(
-  current: LayoutBlock,
-  next: LayoutBlock,
-  metrics: LayoutMetrics
-): boolean {
-  const vGap = verticalGapBetween(current.bbox, next.bbox);
-  const hGap = horizontalGapBetween(current.bbox, next.bbox);
-
-  return vGap <= metrics.verticalThreshold && hGap < metrics.horizontalThreshold;
-}
-
-function separatorCenter(separator: ColumnSeparator): number {
-  return (separator.left + separator.right) / 2;
-}
-
-function pickGroupRole(blocks: LayoutBlock[]): OcrLayoutRole {
-  if (blocks.some((block) => block.layoutRole === 'heading')) {
-    return 'heading';
-  }
-
-  if (blocks.some((block) => block.layoutRole === 'side')) {
-    return 'side';
-  }
-
-  if (blocks.some((block) => block.layoutRole === 'column')) {
-    return 'column';
-  }
-
-  return 'flow';
-}
-
-function mergeBlocks(blocks: LayoutBlock[], layoutRole = pickGroupRole(blocks)): LayoutBlock {
-  const sortedTokens = sortTokens(blocks.flatMap((block) => block.tokens));
-
-  return {
-    bbox: getBounds(sortedTokens),
-    tokens: sortedTokens,
-    text: tokensToText(sortedTokens),
-    layoutRole,
-    vGap: Math.min(...blocks.map((block) => block.vGap)),
-    hGap: Math.min(...blocks.map((block) => block.hGap)),
-    trackIndex: blocks[0]?.trackIndex ?? null,
-    spansSeparator: blocks.some((block) => block.spansSeparator),
-  };
-}
+// ─── Token Processing ─────────────────────────────────────────────────────────
 
 function normalizeToken(token: OcrToken): OcrToken | null {
   const text = token.text.replace(/\s+/g, ' ').trim();
@@ -561,6 +470,8 @@ function normalizeToken(token: OcrToken): OcrToken | null {
 function sortTokens(tokens: OcrToken[]): OcrToken[] {
   return [...tokens].sort((a, b) => a.bbox.y - b.bbox.y || a.bbox.x - b.bbox.x);
 }
+
+// ─── Text Assembly ────────────────────────────────────────────────────────────
 
 function tokensToText(tokens: OcrToken[]): string {
   const lines = groupTokensIntoLines(tokens);
@@ -607,25 +518,13 @@ function joinLine(tokens: OcrToken[]): string {
   }, '');
 }
 
+// ─── Geometry Utilities ───────────────────────────────────────────────────────
+
 function getBounds(tokens: OcrToken[]): OcrBoundingBox {
   const minX = Math.min(...tokens.map((token) => token.bbox.x));
   const minY = Math.min(...tokens.map((token) => token.bbox.y));
   const maxX = Math.max(...tokens.map((token) => token.bbox.x + token.bbox.width));
   const maxY = Math.max(...tokens.map((token) => token.bbox.y + token.bbox.height));
-
-  return {
-    x: minX,
-    y: minY,
-    width: maxX - minX,
-    height: maxY - minY,
-  };
-}
-
-function mergeBounds(bounds: OcrBoundingBox[]): OcrBoundingBox {
-  const minX = Math.min(...bounds.map((bbox) => bbox.x));
-  const minY = Math.min(...bounds.map((bbox) => bbox.y));
-  const maxX = Math.max(...bounds.map((bbox) => bbox.x + bbox.width));
-  const maxY = Math.max(...bounds.map((bbox) => bbox.y + bbox.height));
 
   return {
     x: minX,
@@ -643,36 +542,6 @@ function verticalGapBetween(a: OcrBoundingBox, b: OcrBoundingBox): number {
   return Math.max(0, a.y - (b.y + b.height));
 }
 
-function horizontalGapBetween(a: OcrBoundingBox, b: OcrBoundingBox): number {
-  if (a.x <= b.x) {
-    return Math.max(0, b.x - (a.x + a.width));
-  }
-
-  return Math.max(0, a.x - (b.x + b.width));
-}
-
-function horizontalOverlapRatio(a: OcrBoundingBox, b: OcrBoundingBox): number {
-  const overlap = Math.max(
-    0,
-    Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x)
-  );
-
-  return overlap / Math.max(Math.min(a.width, b.width), 1);
-}
-
-function verticalOverlapRatio(a: OcrBoundingBox, b: OcrBoundingBox): number {
-  const overlap = Math.max(
-    0,
-    Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y)
-  );
-
-  return overlap / Math.max(Math.min(a.height, b.height), 1);
-}
-
 function overlapWidth(a: OcrBoundingBox, b: OcrBoundingBox): number {
   return Math.max(0, Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x));
-}
-
-function overlapX(bbox: OcrBoundingBox, left: number, right: number): number {
-  return Math.max(0, Math.min(bbox.x + bbox.width, right) - Math.max(bbox.x, left));
 }
