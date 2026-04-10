@@ -54,6 +54,7 @@
     --surface-sunken: 220 20% 95%;
 
     --font-display: 'Calibri', 'Arial', system-ui, -apple-system, sans-serif;
+    --font-editorial: 'Iowan Old Style', 'Palatino Linotype', 'Book Antiqua', Georgia, serif;
     --font-mono: 'JetBrains Mono', 'Consolas', monospace;
 
     --shadow-sm: 0 1px 2px 0 hsl(220 25% 10% / 0.04);
@@ -154,6 +155,32 @@
 
   .text-balance {
     text-wrap: balance;
+  }
+
+  .landing-grid {
+    background-color: hsl(var(--background));
+    background-image:
+      linear-gradient(hsl(220 20% 84% / 0.18) 1px, transparent 1px),
+      linear-gradient(90deg, hsl(220 20% 84% / 0.18) 1px, transparent 1px);
+    background-size: 40px 40px;
+  }
+
+  .landing-noise {
+    background-image:
+      radial-gradient(circle at 20% 20%, hsl(0 0% 100% / 0.7), transparent 18%),
+      radial-gradient(circle at 80% 30%, hsl(0 0% 100% / 0.55), transparent 20%),
+      radial-gradient(circle at 50% 80%, hsl(220 20% 95% / 0.85), transparent 22%);
+  }
+
+  .landing-kicker {
+    font-size: 0.72rem;
+    letter-spacing: 0.26em;
+    text-transform: uppercase;
+    color: hsl(var(--muted-foreground));
+  }
+
+  .font-editorial {
+    font-family: var(--font-editorial);
   }
 }
 
