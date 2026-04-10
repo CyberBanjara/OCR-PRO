@@ -307,72 +307,136 @@ function makeLineSegment(tokens: OcrToken[], lineIndex: number): LineSegment {
   };
 }
 
-// ─── Step 2: Segment Clustering ───────────────────────────────────────────────
+// ─── Step 2: Column Lane Detection + Vertical Merging ────────────────────────
 
 /**
- * Clusters segments into spatial blocks using union-find.
+ * Clusters segments into spatial blocks using COLUMN LANE DETECTION.
  *
- * Two segments in DIFFERENT lines are merged into the same block if:
- *   1. They are vertically close (within 4x median line height)
- *   2. Their horizontal extents overlap by at least 20%
+ * WHY NOT UNION-FIND: On dense pages, union-find suffers from "transitive
+ * drift" — a full-width body segment (x=20-550) overlaps with both a left
+ * column (x=20-380) AND a right sidebar (x=410-550), bridging them into
+ * one giant block. No overlap threshold can prevent this because the
+ * bridge segment genuinely overlaps with both.
  *
- * Segments on the SAME line are never merged (they were deliberately split).
+ * THE FIX: Don't ask "which segments overlap?" — instead ask "which
+ * vertical strip of the page does each segment BELONG TO?"
+ *
+ * Algorithm:
+ *   1. Project all segment LEFT-EDGES onto the X axis
+ *   2. Recursively find the largest gap in sorted left-edges
+ *      → each gap defines a column lane boundary
+ *   3. Assign each segment to the lane its left-edge falls in
+ *   4. Within each lane, merge vertically adjacent segments into blocks
+ *
+ * A full-width segment (leftX=20) stays in the body lane because its
+ * LEFT edge is at 20, regardless of how far right it extends.
  */
 function clusterSegmentsIntoBlocks(
   segments: LineSegment[],
   metrics: LayoutMetrics
 ): OcrToken[][] {
   if (segments.length === 0) return [];
+  if (segments.length === 1) return [segments[0].tokens];
 
-  // Union-Find with path compression
-  const parent = segments.map((_, i) => i);
+  // ── Phase 1: Detect column lanes from segment left-edge positions ──
+  const laneGapThreshold = Math.max(
+    metrics.pageWidth * 0.08,
+    metrics.medianWordGap * 4,
+    15
+  );
 
-  function find(x: number): number {
-    if (parent[x] !== x) parent[x] = find(parent[x]);
-    return parent[x];
+  const lanes = detectColumnLanes(segments, laneGapThreshold);
+
+  if (typeof window !== 'undefined' && (window as any).__OCR_DEBUG__) {
+    console.log('[Lanes]', lanes.length, 'lanes detected, threshold:', Math.round(laneGapThreshold),
+      'leftEdges:', lanes.map(l => Math.round(l[0]?.leftX ?? 0)));
   }
 
-  function union(x: number, y: number): void {
-    const rx = find(x);
-    const ry = find(y);
-    if (rx !== ry) parent[rx] = ry;
-  }
+  // ── Phase 2: Within each lane, merge vertically adjacent segments ──
+  const blocks: OcrToken[][] = [];
+  const maxVertGap = metrics.medianHeight * 2.5;
 
-  const maxVertDist = metrics.medianHeight * 4;
+  for (const lane of lanes) {
+    if (lane.length === 0) continue;
 
-  for (let i = 0; i < segments.length; i++) {
-    for (let j = i + 1; j < segments.length; j++) {
-      const a = segments[i];
-      const b = segments[j];
+    // Sort lane segments top-to-bottom
+    const sorted = [...lane].sort((a, b) => a.centerY - b.centerY);
 
-      // Never merge segments from the same line
-      if (a.lineIndex === b.lineIndex) continue;
+    // Merge consecutive segments that are vertically close
+    let currentGroup: LineSegment[] = [sorted[0]];
 
-      // Must be vertically close
-      const vertDist = Math.abs(a.centerY - b.centerY);
-      if (vertDist > maxVertDist) continue;
+    for (let i = 1; i < sorted.length; i++) {
+      const prev = currentGroup[currentGroup.length - 1];
+      const curr = sorted[i];
+      // Gap = top of current segment minus bottom of previous segment
+      const gap = curr.topY - prev.bottomY;
 
-      // Must overlap horizontally by at least 20%
-      const overlapLeft = Math.max(a.leftX, b.leftX);
-      const overlapRight = Math.min(a.rightX, b.rightX);
-      const overlapWidth = Math.max(0, overlapRight - overlapLeft);
-
-      const minSegWidth = Math.min(a.rightX - a.leftX, b.rightX - b.leftX);
-      if (minSegWidth > 0 && overlapWidth >= minSegWidth * 0.20) {
-        union(i, j);
+      if (gap <= maxVertGap) {
+        currentGroup.push(curr);
+      } else {
+        // Vertical gap too large → start a new block
+        blocks.push(currentGroup.flatMap(s => s.tokens));
+        currentGroup = [curr];
       }
+    }
+
+    // Don't forget the last group
+    blocks.push(currentGroup.flatMap(s => s.tokens));
+  }
+
+  return blocks;
+}
+
+/**
+ * Recursively splits segments into column lanes by finding the largest
+ * gap in their sorted left-edge X positions.
+ *
+ * Example:
+ *   Body segments:    leftX ≈ 20, 20, 22, 25, 30, 35
+ *   Sidebar segments: leftX ≈ 410, 412, 415
+ *   ──────────────────────────────────────────────
+ *   Sorted: [20, 20, 22, 25, 30, 35, ... 410, 412, 415]
+ *   Largest gap: 375 (between 35 and 410)
+ *   → Split into Lane 1 [20-35] and Lane 2 [410-415]
+ *   → Recurse on each: no more large gaps → done
+ *   → 2 lanes
+ *
+ * For a 3-column layout, the recursion would find 2 splits → 3 lanes.
+ */
+function detectColumnLanes(
+  segments: LineSegment[],
+  gapThreshold: number
+): LineSegment[][] {
+  if (segments.length <= 1) return [segments];
+
+  // Sort segments by left-edge X position
+  const sorted = [...segments].sort((a, b) => a.leftX - b.leftX);
+
+  // Find the largest gap between consecutive left-edges
+  let maxGap = 0;
+  let gapIndex = -1;
+
+  for (let i = 1; i < sorted.length; i++) {
+    const gap = sorted[i].leftX - sorted[i - 1].leftX;
+    if (gap > maxGap) {
+      maxGap = gap;
+      gapIndex = i;
     }
   }
 
-  // Collect blocks
-  const blockMap = new Map<number, OcrToken[]>();
-  for (let i = 0; i < segments.length; i++) {
-    const root = find(i);
-    if (!blockMap.has(root)) blockMap.set(root, []);
-    blockMap.get(root)!.push(...segments[i].tokens);
+  // If the gap exceeds threshold, split and recurse
+  if (maxGap >= gapThreshold && gapIndex > 0) {
+    const leftGroup = sorted.slice(0, gapIndex);
+    const rightGroup = sorted.slice(gapIndex);
+
+    return [
+      ...detectColumnLanes(leftGroup, gapThreshold),
+      ...detectColumnLanes(rightGroup, gapThreshold),
+    ];
   }
 
-  return [...blockMap.values()];
+  // No significant gap → all segments belong to one lane
+  return [segments];
 }
 
 // ─── Step 3: Layout Role Assignment ───────────────────────────────────────────
