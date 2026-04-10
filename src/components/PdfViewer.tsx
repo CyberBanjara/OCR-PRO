@@ -37,15 +37,17 @@ export function PdfViewer({ pageNumber, scale = 1.5 }: PdfViewerProps) {
   }
 
   return (
-    <div className="relative">
+    <div className="ocr-panel relative h-full overflow-auto overscroll-contain p-4 sm:p-6">
       {loading && (
-        <Skeleton className="absolute inset-0 rounded-lg" />
+        <Skeleton className="absolute inset-4 rounded-[1.5rem] sm:inset-6" />
       )}
-      <canvas
-        ref={canvasRef}
-        className="w-full h-auto rounded-lg shadow-md"
-        style={{ display: loading ? 'none' : 'block' }}
-      />
+      <div className="flex min-h-full items-start justify-center">
+        <canvas
+          ref={canvasRef}
+          className="h-auto max-w-full rounded-[1.5rem] border border-slate-200 bg-white shadow-[0_28px_80px_-36px_rgba(15,23,42,0.45)]"
+          style={{ display: loading ? 'none' : 'block' }}
+        />
+      </div>
     </div>
   );
 }

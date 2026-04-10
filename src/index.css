@@ -182,6 +182,13 @@
   .font-editorial {
     font-family: var(--font-editorial);
   }
+
+  .ocr-panel {
+    border: 1px solid hsl(var(--border) / 0.7);
+    border-radius: 1.75rem;
+    background: linear-gradient(180deg, hsl(var(--card) / 0.95), hsl(var(--surface-sunken) / 0.9));
+    box-shadow: 0 24px 80px -48px hsl(220 25% 10% / 0.35);
+  }
 }
 
 /* Custom scrollbar */

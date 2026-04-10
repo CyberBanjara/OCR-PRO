@@ -14,16 +14,20 @@ import { ExportPanel } from '@/components/ExportPanel';
 import { ProjectDashboard } from '@/components/ProjectDashboard';
 import { Button } from '@/components/ui/button';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
-import { Play, Pause, Square, RotateCcw, ChevronLeft, ChevronRight, Home, Eye, Type } from 'lucide-react';
+import { Play, Pause, Square, RotateCcw, ChevronLeft, ChevronRight, Home, Eye, Type, ZoomIn, ZoomOut } from 'lucide-react';
 import type { OcrProject, OcrPage } from '@/types/ocr';
 import { motion, AnimatePresence } from 'framer-motion';
 
 type View = 'dashboard' | 'upload' | 'workspace';
+const PREVIEW_SCALE_MIN = 0.8;
+const PREVIEW_SCALE_MAX = 2.4;
+const PREVIEW_SCALE_STEP = 0.2;
 
 export default function OcrApp() {
   const [view, setView] = useState<View>('dashboard');
   const [loading, setLoading] = useState(false);
   const [viewTab, setViewTab] = useState<string>('preview');
+  const [previewScale, setPreviewScale] = useState(1.5);
   const store = useOcrStore();
 
   // Load project from dashboard
@@ -219,11 +223,12 @@ export default function OcrApp() {
   const { currentProject, pages, currentPageNumber, isProcessing, isPaused } = store;
   const currentPage = pages.find(p => p.pageNumber === currentPageNumber);
   const failedCount = pages.filter(p => p.status === 'failed').length;
+  const previewZoom = Math.round((previewScale / 1.5) * 100);
 
   return (
-    <div className="min-h-screen bg-background flex flex-col">
+    <div className="h-[100dvh] overflow-hidden bg-background flex flex-col">
       {/* Header */}
-      <header className="glass border-b border-border px-4 py-2.5 flex items-center justify-between sticky top-0 z-50">
+      <header className="glass border-b border-border/70 px-4 py-3 flex items-center justify-between sticky top-0 z-50 backdrop-blur-2xl">
         <div className="flex items-center gap-3">
           <Button variant="ghost" size="sm" onClick={goHome} className="gap-1.5">
             <Home className="w-4 h-4" />
@@ -268,9 +273,9 @@ export default function OcrApp() {
         </div>
       </header>
 
-      <div className="flex flex-1 overflow-hidden">
+      <div className="flex flex-1 min-h-0 overflow-hidden">
         {/* Page sidebar */}
-        <aside className="w-28 border-r border-border bg-card/30 overflow-y-auto p-2 flex flex-col gap-1 shrink-0">
+        <aside className="w-28 border-r border-border/70 bg-card/40 overflow-y-auto overscroll-contain p-2.5 flex flex-col gap-2 shrink-0">
           {pages.map(page => (
             <PageThumbnail
               key={page.id}
@@ -285,53 +290,96 @@ export default function OcrApp() {
         </aside>
 
         {/* Main content */}
-        <main className="flex-1 flex flex-col overflow-hidden">
+        <main className="flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden bg-[linear-gradient(180deg,hsl(var(--background)),hsl(var(--surface-sunken)))]">
           {/* Progress */}
           <div className="px-4 pt-3">
             <OcrProgressBar />
           </div>
 
           {/* Page nav */}
-          <div className="flex items-center justify-center gap-3 px-4 py-2">
-            <Button
-              variant="ghost"
-              size="icon"
-              className="h-8 w-8"
-              disabled={currentPageNumber <= 1}
-              onClick={() => store.setCurrentPage(currentPageNumber - 1)}
-            >
-              <ChevronLeft className="w-4 h-4" />
-            </Button>
-            <span className="text-sm font-mono text-muted-foreground">
-              {currentPageNumber} / {pages.length}
-            </span>
-            <Button
-              variant="ghost"
-              size="icon"
-              className="h-8 w-8"
-              disabled={currentPageNumber >= pages.length}
-              onClick={() => store.setCurrentPage(currentPageNumber + 1)}
-            >
-              <ChevronRight className="w-4 h-4" />
-            </Button>
+          <div className="px-4 py-3">
+            <div className="glass flex items-center justify-between rounded-2xl border border-border/60 px-3 py-2">
+              <div>
+                <p className="text-[11px] uppercase tracking-[0.22em] text-muted-foreground">Review Page</p>
+                <p className="text-sm font-medium text-foreground">
+                  Page {currentPageNumber}
+                  <span className="ml-1 text-muted-foreground">of {pages.length}</span>
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-9 w-9 rounded-full"
+                  disabled={currentPageNumber <= 1}
+                  onClick={() => store.setCurrentPage(currentPageNumber - 1)}
+                >
+                  <ChevronLeft className="w-4 h-4" />
+                </Button>
+                <span className="rounded-full border border-border/70 bg-background/70 px-3 py-1 text-xs font-mono text-muted-foreground">
+                  {currentPageNumber} / {pages.length}
+                </span>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-9 w-9 rounded-full"
+                  disabled={currentPageNumber >= pages.length}
+                  onClick={() => store.setCurrentPage(currentPageNumber + 1)}
+                >
+                  <ChevronRight className="w-4 h-4" />
+                </Button>
+              </div>
+            </div>
           </div>
 
           {/* Tabs: Preview / Text */}
-          <div className="flex-1 overflow-hidden px-4 pb-4">
+          <div className="flex-1 min-h-0 overflow-hidden px-4 pb-4">
             <Tabs value={viewTab} onValueChange={setViewTab} className="h-full flex flex-col">
-              <TabsList className="mb-3 self-start">
-                <TabsTrigger value="preview" className="gap-1.5 text-xs">
-                  <Eye className="w-3.5 h-3.5" />
-                  Preview
-                </TabsTrigger>
-                <TabsTrigger value="text" className="gap-1.5 text-xs">
-                  <Type className="w-3.5 h-3.5" />
-                  OCR Text
-                </TabsTrigger>
-              </TabsList>
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+                <TabsList className="self-start rounded-full bg-card/80 p-1 shadow-sm">
+                  <TabsTrigger value="preview" className="gap-1.5 text-xs">
+                    <Eye className="w-3.5 h-3.5" />
+                    Preview
+                  </TabsTrigger>
+                  <TabsTrigger value="text" className="gap-1.5 text-xs">
+                    <Type className="w-3.5 h-3.5" />
+                    OCR Text
+                  </TabsTrigger>
+                </TabsList>
 
-              <div className="flex-1 overflow-y-auto">
-                <TabsContent value="preview" className="mt-0">
+                {viewTab === 'preview' && (
+                  <div className="glass flex items-center gap-2 rounded-full border border-border/60 px-2 py-1.5">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="h-8 rounded-full px-3 text-xs"
+                      disabled={previewScale <= PREVIEW_SCALE_MIN}
+                      onClick={() => setPreviewScale((current) => Math.max(PREVIEW_SCALE_MIN, current - PREVIEW_SCALE_STEP))}
+                    >
+                      <ZoomOut className="w-3.5 h-3.5" />
+                      Minimize
+                    </Button>
+                    <span className="min-w-14 text-center text-xs font-mono text-muted-foreground">
+                      {previewZoom}%
+                    </span>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="h-8 rounded-full px-3 text-xs"
+                      disabled={previewScale >= PREVIEW_SCALE_MAX}
+                      onClick={() => setPreviewScale((current) => Math.min(PREVIEW_SCALE_MAX, current + PREVIEW_SCALE_STEP))}
+                    >
+                      <ZoomIn className="w-3.5 h-3.5" />
+                      Maximize
+                    </Button>
+                  </div>
+                )}
+              </div>
+
+              <div className="flex-1 min-h-0 overflow-hidden">
+                <TabsContent value="preview" className="mt-0 h-full">
                   <AnimatePresence mode="wait">
                     <motion.div
                       key={currentPageNumber}
@@ -339,12 +387,13 @@ export default function OcrApp() {
                       animate={{ opacity: 1 }}
                       exit={{ opacity: 0 }}
                       transition={{ duration: 0.15 }}
+                      className="h-full"
                     >
-                      <PdfViewer pageNumber={currentPageNumber} />
+                      <PdfViewer pageNumber={currentPageNumber} scale={previewScale} />
                     </motion.div>
                   </AnimatePresence>
                 </TabsContent>
-                <TabsContent value="text" className="mt-0">
+                <TabsContent value="text" className="mt-0 h-full">
                   <OcrTextViewer pageNumber={currentPageNumber} />
                 </TabsContent>
               </div>
@@ -353,7 +402,7 @@ export default function OcrApp() {
         </main>
 
         {/* Right sidebar */}
-        <aside className="w-64 border-l border-border bg-card/30 overflow-y-auto p-4 space-y-6 shrink-0 hidden lg:block">
+        <aside className="w-72 border-l border-border/70 bg-card/40 overflow-y-auto overscroll-contain p-4 space-y-4 shrink-0 hidden lg:block">
           <SearchPanel />
           <ExportPanel />
         </aside>

@@ -30,14 +30,19 @@ export function SearchPanel() {
   };
 
   return (
-    <div className="space-y-3">
+    <section className="rounded-[1.5rem] border border-border/70 bg-[linear-gradient(180deg,hsl(var(--card)),hsl(var(--surface-sunken)))] p-4 shadow-[0_18px_50px_-34px_rgba(15,23,42,0.3)]">
+      <div className="mb-4">
+        <p className="text-[11px] uppercase tracking-[0.2em] text-muted-foreground">Search</p>
+        <h3 className="mt-1 text-sm font-semibold">Find text across processed pages</h3>
+      </div>
+      <div className="space-y-3">
       <div className="relative">
         <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
         <Input
           value={localQuery}
           onChange={(e) => handleSearch(e.target.value)}
           placeholder="Search across all pages..."
-          className="pl-9 pr-9 bg-card border-border"
+          className="pl-9 pr-9 bg-background/70 border-border"
         />
         {localQuery && (
           <button
@@ -50,7 +55,7 @@ export function SearchPanel() {
       </div>
 
       {results.length > 0 && (
-        <div className="space-y-1 max-h-64 overflow-y-auto">
+        <div className="space-y-1 max-h-64 overflow-y-auto overscroll-contain pr-1">
           <p className="text-xs text-muted-foreground px-1">
             {results.reduce((s, r) => s + r.matches, 0)} matches in {results.length} pages
           </p>
@@ -75,7 +80,8 @@ export function SearchPanel() {
       {localQuery && results.length === 0 && (
         <p className="text-sm text-muted-foreground text-center py-4">No matches found</p>
       )}
-    </div>
+      </div>
+    </section>
   );
 }
 

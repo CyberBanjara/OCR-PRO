@@ -20,13 +20,13 @@ export function PageThumbnail({ pageNumber, thumbnailUrl, status, confidence, is
       whileHover={{ scale: 1.03 }}
       whileTap={{ scale: 0.98 }}
       className={cn(
-        "relative flex flex-col items-center gap-1.5 p-2 rounded-xl transition-all border",
+        "relative flex flex-col items-center gap-1.5 p-2 rounded-2xl transition-all border",
         isActive 
-          ? "border-primary bg-primary/5 shadow-glow" 
-          : "border-transparent hover:border-border hover:bg-card/50"
+          ? "border-primary/50 bg-primary/8 shadow-glow" 
+          : "border-transparent hover:border-border/70 hover:bg-card/70"
       )}
     >
-      <div className="relative w-16 h-20 rounded-md overflow-hidden bg-muted flex items-center justify-center">
+      <div className="relative w-16 h-20 rounded-xl overflow-hidden bg-muted flex items-center justify-center border border-border/50">
         {thumbnailUrl ? (
           <img src={thumbnailUrl} alt={`Page ${pageNumber}`} className="w-full h-full object-cover" />
         ) : (

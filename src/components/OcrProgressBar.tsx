@@ -14,7 +14,7 @@ export function OcrProgressBar() {
   const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
 
   return (
-    <div className="glass rounded-xl p-4 space-y-3">
+    <div className="glass rounded-[1.5rem] border border-border/60 p-4 space-y-3 shadow-[0_16px_50px_-36px_rgba(15,23,42,0.38)]">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           {isProcessing && !isPaused ? (
