@@ -11,77 +11,62 @@ interface LayoutMetrics {
   medianHeight: number;
   pageWidth: number;
   pageHeight: number;
-  /** Minimum absolute gap to consider as a gutter (conservative) */
+  /** Minimum absolute gap used as a baseline for splitting decisions */
   gutterThreshold: number;
-  /** Median inter-word spacing computed from actual token gaps */
+  /** Typical inter-word spacing (30th percentile of observed gaps) */
   medianWordGap: number;
   /** Vertical distance to consider tokens on the same line */
   lineThreshold: number;
 }
 
 /**
- * A horizontal band across the page where column structure is consistent.
- * Full-width headings occupy their own band; multi-column body is another.
+ * A segment: a contiguous group of tokens within a single line, separated
+ * from other segments on the same line by a significant horizontal gap.
  */
-interface HorizontalBand {
-  yStart: number;
-  yEnd: number;
-  lines: OcrToken[][];
-  isHeading: boolean;
+interface LineSegment {
+  tokens: OcrToken[];
+  leftX: number;
+  rightX: number;
+  topY: number;
+  bottomY: number;
+  centerY: number;
+  lineIndex: number;
 }
 
 /**
- * A vertical column region within a band (the actual spatial lane on the page).
+ * A categorized spatial block: a cluster of segments that form a
+ * visually distinct region on the page.
  */
-interface ColumnRegion {
-  left: number;
-  right: number;
-  index: number;
-}
-
-/**
- * A reading group: contiguous block of tokens that should be read as a unit.
- */
-interface ReadingGroup {
+interface SpatialBlock {
   tokens: OcrToken[];
   bbox: OcrBoundingBox;
   layoutRole: OcrLayoutRole;
-  bandIndex: number;
-  columnIndex: number;
-}
-
-interface GutterCandidate {
-  left: number;
-  right: number;
-  centerX: number;
-}
-
-interface GutterCluster {
-  left: number;
-  right: number;
-  centerX: number;
-  lineCount: number;
 }
 
 // ─── Tuning Constants ─────────────────────────────────────────────────────────
 
-/** Fraction of lines that must show a gutter for it to be "stable" */
-const MIN_GUTTER_LINES_RATIO = 0.20;
-/** Gutter must appear in at least this many lines */
-const MIN_GUTTER_LINE_COUNT = 2;
+/**
+ * For splitting lines: a gap must be at least this many times the
+ * per-line Q1 gap to be treated as a segment boundary.
+ * 3.5x means "clearly much bigger than normal word spacing."
+ */
+const SPLIT_FACTOR = 3.5;
+
 /** Heading constraints */
-const HEADING_MAX_LINES = 2;
 const HEADING_MAX_WORDS = 14;
 const HEADING_MAX_WIDTH_RATIO = 0.75;
-/**
- * For relative-gap detection: a gap must be at least this many times
- * larger than the median inter-word gap on the same line to be considered
- * a column boundary.
- */
-const RELATIVE_GAP_FACTOR = 2.8;
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
+/**
+ * Main entry point. Breaks a page's tokens into spatial blocks by:
+ *   1. Grouping tokens into text lines
+ *   2. Splitting each line at significant horizontal gaps → segments
+ *   3. Clustering nearby segments into spatial blocks (union-find)
+ *   4. Assigning layout roles (heading / side / flow)
+ *   5. Sorting blocks left-to-right, top-to-bottom
+ *   6. Producing one OcrColumn per block
+ */
 export function buildColumnLayout(tokens: OcrToken[]): ColumnLayoutResult {
   const normalizedTokens = tokens
     .map(normalizeToken)
@@ -95,27 +80,33 @@ export function buildColumnLayout(tokens: OcrToken[]): ColumnLayoutResult {
   const metrics = computeLayoutMetrics(normalizedTokens, pageBounds);
   const lines = groupTokensIntoLines(normalizedTokens, metrics);
 
-  // Step 1: Segment into horizontal bands (heading bands vs body bands)
-  const bands = segmentIntoBands(lines, metrics, pageBounds);
+  // Step 1: Split each line into segments at significant gaps
+  const segments = splitLinesIntoSegments(lines, metrics);
 
-  // Step 2: For each band, detect columns and assign tokens
-  const readingGroups = extractReadingGroups(bands, metrics, pageBounds);
+  // Step 2: Cluster segments into spatial blocks
+  const blocks = clusterSegmentsIntoBlocks(segments, metrics);
 
+  // Step 3: Assign layout roles (heading, side, flow)
+  const categorized = assignLayoutRoles(blocks, metrics, pageBounds);
+
+  // Step 4: Sort blocks left-to-right, top-to-bottom
+  const sortedBlocks = sortBlocks(categorized, metrics);
+
+  // Debug logging
   if (typeof window !== 'undefined' && (window as any).__OCR_DEBUG__) {
     console.log('[ColumnLayout] tokens:', normalizedTokens.length,
       'lines:', lines.length,
-      'bands:', bands.length,
-      'groups:', readingGroups.length,
+      'segments:', segments.length,
+      'blocks:', sortedBlocks.length,
       'pageW:', Math.round(pageBounds.width),
-      'gutterThresh:', Math.round(metrics.gutterThreshold),
       'medianWordGap:', Math.round(metrics.medianWordGap),
-      'roles:', readingGroups.map(g => g.layoutRole)
+      'roles:', sortedBlocks.map(b => b.layoutRole)
     );
   }
 
-  // Step 3: Build OcrColumn per group, in reading order
-  const columns = readingGroups
-    .map((group, index) => buildColumn(group.tokens, index + 1, group.layoutRole))
+  // Step 5: Build OcrColumn per block
+  const columns = sortedBlocks
+    .map((block, index) => buildColumn(block.tokens, index + 1, block.layoutRole))
     .filter((column): column is OcrColumn => column !== null);
 
   return {
@@ -154,13 +145,9 @@ export function buildColumn(
 // ─── Layout Metrics ───────────────────────────────────────────────────────────
 
 /**
- * Computes adaptive layout metrics based on actual token dimensions,
- * the page coordinate space, AND observed inter-word spacing.
- *
- * The key insight: the gutter threshold should be based on actual
- * inter-word spacing (how far apart words are on the same line),
- * NOT on word width (how wide a single word is). These can be very
- * different — e.g. words might be 60px wide but only 4px apart.
+ * Computes adaptive layout metrics. The key metric is `medianWordGap`:
+ * the typical inter-word spacing, used as the baseline for all gap-based
+ * splitting decisions.
  */
 function computeLayoutMetrics(tokens: OcrToken[], pageBounds: OcrBoundingBox): LayoutMetrics {
   const heights = tokens.map((token) => token.bbox.height).sort((a, b) => a - b);
@@ -172,13 +159,8 @@ function computeLayoutMetrics(tokens: OcrToken[], pageBounds: OcrBoundingBox): L
   const pageWidth = Math.max(pageBounds.width, 1);
   const pageHeight = Math.max(pageBounds.height, 1);
 
-  // Compute actual median inter-word gap from the tokens
   const medianWordGap = computeMedianWordGap(tokens, medianHeight);
 
-  // Gutter threshold: use the LARGER of:
-  //   - 2% of page width (works at any scale)
-  //   - 2.5x the median word gap (adaptive to actual spacing)
-  //   - absolute minimum of 6px
   const gutterThreshold = Math.max(
     pageWidth * 0.02,
     medianWordGap * 2.5,
@@ -198,10 +180,8 @@ function computeLayoutMetrics(tokens: OcrToken[], pageBounds: OcrBoundingBox): L
 }
 
 /**
- * Computes the typical inter-word gap between consecutive tokens on the
- * same line. Uses the 30th percentile (Q1) instead of median because in
- * a multi-column layout, ~50% of gaps might be column gaps. Using Q1
- * ensures we capture actual word spacing, not outlier column gaps.
+ * Computes the typical inter-word gap (30th percentile / Q1) to avoid
+ * column gaps inflating the baseline.
  */
 function computeMedianWordGap(tokens: OcrToken[], medianHeight: number): number {
   const sorted = [...tokens].sort((a, b) => a.bbox.y - b.bbox.y || a.bbox.x - b.bbox.x);
@@ -212,7 +192,6 @@ function computeMedianWordGap(tokens: OcrToken[], medianHeight: number): number 
     const prev = sorted[i - 1];
     const curr = sorted[i];
 
-    // Only consider tokens on the same line
     const prevCenterY = prev.bbox.y + prev.bbox.height / 2;
     const currCenterY = curr.bbox.y + curr.bbox.height / 2;
 
@@ -227,700 +206,258 @@ function computeMedianWordGap(tokens: OcrToken[], medianHeight: number): number 
   if (gaps.length === 0) return 8;
 
   gaps.sort((a, b) => a - b);
-  // Use 30th percentile to avoid column gaps inflating the baseline
   const q1Index = Math.floor(gaps.length * 0.3);
   return gaps[q1Index];
 }
 
-// ─── Band Segmentation ───────────────────────────────────────────────────────
+// ─── Step 1: Line Segment Splitting ───────────────────────────────────────────
 
 /**
- * Splits the page into horizontal bands. Lines that span the full width
- * (or nearly so) with few words are treated as heading bands; contiguous
- * non-heading lines form body bands.
+ * Splits each text line into segments at significant horizontal gaps.
+ *
+ * For lines with 3+ tokens (2+ gaps): uses the RELATIVE approach.
+ * A gap is significant if it's >= SPLIT_FACTOR times the per-line Q1 gap
+ * AND >= an absolute minimum.
+ *
+ * For lines with 2 tokens (1 gap): uses a conservative absolute threshold
+ * to avoid splitting normal word pairs.
+ *
+ * For lines with 1 token: no splitting possible.
  */
-function segmentIntoBands(
+function splitLinesIntoSegments(
   lines: OcrToken[][],
-  metrics: LayoutMetrics,
-  pageBounds: OcrBoundingBox
-): HorizontalBand[] {
-  if (lines.length === 0) return [];
+  metrics: LayoutMetrics
+): LineSegment[] {
+  const segments: LineSegment[] = [];
 
-  const bands: HorizontalBand[] = [];
-  let currentLines: OcrToken[][] = [];
-  let currentIsHeading: boolean | null = null;
+  for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+    const line = lines[lineIdx];
+    const sorted = [...line].sort((a, b) => a.bbox.x - b.bbox.x);
+    if (sorted.length === 0) continue;
 
-  for (const line of lines) {
-    const heading = isHeadingLine(line, lines, metrics, pageBounds);
-
-    if (currentIsHeading !== null && heading !== currentIsHeading) {
-      // Flush the current band
-      bands.push(makeBand(currentLines, currentIsHeading));
-      currentLines = [];
+    if (sorted.length === 1) {
+      // Single token → single segment
+      segments.push(makeLineSegment(sorted, lineIdx));
+      continue;
     }
 
-    currentLines.push(line);
-    currentIsHeading = heading;
+    // Compute all inter-token gaps
+    const gaps: number[] = [];
+    for (let i = 1; i < sorted.length; i++) {
+      const prevRight = sorted[i - 1].bbox.x + sorted[i - 1].bbox.width;
+      const currLeft = sorted[i].bbox.x;
+      gaps.push(Math.max(0, currLeft - prevRight));
+    }
+
+    // Determine split threshold
+    let splitThreshold: number;
+
+    if (gaps.length >= 2) {
+      // Relative approach: compute per-line Q1 and apply factor
+      const sortedGaps = [...gaps].sort((a, b) => a - b);
+      const q1Idx = Math.floor(sortedGaps.length * 0.3);
+      const q1Gap = Math.max(sortedGaps[q1Idx], 2);
+      splitThreshold = Math.max(
+        q1Gap * SPLIT_FACTOR,
+        metrics.medianWordGap * 2,
+        metrics.medianHeight,
+        10
+      );
+    } else {
+      // Only 1 gap (2 tokens): use conservative absolute threshold
+      splitThreshold = Math.max(
+        metrics.medianWordGap * 4,
+        metrics.pageWidth * 0.08,
+        20
+      );
+    }
+
+    // Split line at gaps exceeding threshold
+    let segStart = 0;
+    for (let i = 0; i < gaps.length; i++) {
+      if (gaps[i] >= splitThreshold) {
+        const segTokens = sorted.slice(segStart, i + 1);
+        if (segTokens.length > 0) {
+          segments.push(makeLineSegment(segTokens, lineIdx));
+        }
+        segStart = i + 1;
+      }
+    }
+
+    // Last segment
+    const lastTokens = sorted.slice(segStart);
+    if (lastTokens.length > 0) {
+      segments.push(makeLineSegment(lastTokens, lineIdx));
+    }
   }
 
-  if (currentLines.length > 0) {
-    bands.push(makeBand(currentLines, currentIsHeading ?? false));
-  }
-
-  return bands;
+  return segments;
 }
 
-function makeBand(lines: OcrToken[][], isHeading: boolean): HorizontalBand {
-  const allTokens = lines.flat();
-  const bounds = getBounds(allTokens);
+function makeLineSegment(tokens: OcrToken[], lineIndex: number): LineSegment {
+  const bounds = getBounds(tokens);
   return {
-    yStart: bounds.y,
-    yEnd: bounds.y + bounds.height,
-    lines,
-    isHeading,
+    tokens,
+    leftX: bounds.x,
+    rightX: bounds.x + bounds.width,
+    topY: bounds.y,
+    bottomY: bounds.y + bounds.height,
+    centerY: bounds.y + bounds.height / 2,
+    lineIndex,
   };
 }
 
-/**
- * A line is considered a heading if it's short (few words), isolated vertically,
- * and significantly narrower than the page.
- */
-function isHeadingLine(
-  line: OcrToken[],
-  allLines: OcrToken[][],
-  metrics: LayoutMetrics,
-  pageBounds: OcrBoundingBox
-): boolean {
-  const bounds = getBounds(line);
-  const wordCount = line.reduce((count, token) => {
-    return count + token.text.split(/\s+/).filter(Boolean).length;
-  }, 0);
-
-  if (wordCount > HEADING_MAX_WORDS) return false;
-
-  const widthRatio = bounds.width / Math.max(pageBounds.width, 1);
-  if (widthRatio >= HEADING_MAX_WIDTH_RATIO) return false;
-
-  // Check vertical gap from nearest line
-  const lineBounds = getBounds(line);
-  let minGap = Infinity;
-
-  for (const otherLine of allLines) {
-    if (otherLine === line) continue;
-    const otherBounds = getBounds(otherLine);
-    const gap = verticalGapBetween(lineBounds, otherBounds);
-    minGap = Math.min(minGap, gap);
-  }
-
-  // Must have significant vertical gap to qualify as heading
-  return minGap > metrics.medianHeight * 1.5;
-}
-
-// ─── Column Detection ─────────────────────────────────────────────────────────
+// ─── Step 2: Segment Clustering ───────────────────────────────────────────────
 
 /**
- * Three-strategy column detection:
+ * Clusters segments into spatial blocks using union-find.
  *
- * Strategy 1 (absolute gap): Look for consistent horizontal gaps that
- * exceed the gutterThreshold. Works for wide, obvious column gutters.
+ * Two segments in DIFFERENT lines are merged into the same block if:
+ *   1. They are vertically close (within 4x median line height)
+ *   2. Their horizontal extents overlap by at least 20%
  *
- * Strategy 2 (relative gap): For each line, compare the LARGEST gap to
- * the MEDIAN gap. If the largest gap is significantly bigger than normal
- * word spacing on that line, it's a column boundary. This is the key
- * strategy for textbook-style layouts where the gutter is narrow but
- * still clearly larger than word spacing.
- *
- * Strategy 3 (density histogram): Project token positions onto the X-axis
- * and find empty vertical bands. Catches cases where individual gaps are
- * small but there's still a clear empty strip.
+ * Segments on the SAME line are never merged (they were deliberately split).
  */
-function detectColumnsInLines(
-  lines: OcrToken[][],
-  metrics: LayoutMetrics,
-  pageBounds: OcrBoundingBox
-): ColumnRegion[] {
-  if (lines.length < 2) return [];
-
-  // Strategy 1: Absolute gap analysis (fast, catches wide gutters)
-  const gapResult = detectColumnsViaGaps(lines, metrics, pageBounds);
-  if (gapResult.length >= 2) return gapResult;
-
-  // Strategy 2: Relative gap analysis (catches narrow gutters)
-  const relativeResult = detectColumnsViaRelativeGaps(lines, metrics, pageBounds);
-  if (relativeResult.length >= 2) return relativeResult;
-
-  // Strategy 3: X-axis density histogram (catches fragmented tokens)
-  const histogramResult = detectColumnsViaHistogram(lines, metrics, pageBounds);
-  if (histogramResult.length >= 2) return histogramResult;
-
-  return [];
-}
-
-// ─── Strategy 1: Absolute Gap Detection ───────────────────────────────────────
-
-/**
- * Find gutters by looking for gaps wider than gutterThreshold on each line.
- */
-function detectColumnsViaGaps(
-  lines: OcrToken[][],
-  metrics: LayoutMetrics,
-  pageBounds: OcrBoundingBox
-): ColumnRegion[] {
-  const gutterCandidates = collectGutterCandidates(lines, metrics.gutterThreshold);
-  if (gutterCandidates.length === 0) return [];
-
-  const gutters = clusterGutters(gutterCandidates, metrics);
-
-  const stableGutters = gutters.filter(
-    (g) =>
-      g.lineCount / lines.length >= MIN_GUTTER_LINES_RATIO &&
-      g.lineCount >= MIN_GUTTER_LINE_COUNT
-  );
-
-  if (stableGutters.length === 0) return [];
-
-  return buildColumnRegions(stableGutters, pageBounds);
-}
-
-function collectGutterCandidates(
-  lines: OcrToken[][],
-  threshold: number
-): GutterCandidate[] {
-  const candidates: GutterCandidate[] = [];
-
-  for (const line of lines) {
-    const sorted = [...line].sort((a, b) => a.bbox.x - b.bbox.x);
-    if (sorted.length < 2) continue;
-
-    for (let i = 1; i < sorted.length; i++) {
-      const prevRight = sorted[i - 1].bbox.x + sorted[i - 1].bbox.width;
-      const currLeft = sorted[i].bbox.x;
-      const gap = currLeft - prevRight;
-
-      if (gap >= threshold) {
-        candidates.push({
-          left: prevRight,
-          right: currLeft,
-          centerX: (prevRight + currLeft) / 2,
-        });
-      }
-    }
-  }
-
-  return candidates;
-}
-
-// ─── Strategy 2: Relative Gap Detection ───────────────────────────────────────
-
-/**
- * For each line with 3+ tokens, compute all inter-token gaps. If the LARGEST
- * gap is significantly bigger (RELATIVE_GAP_FACTOR times) the MEDIAN gap,
- * that largest gap is a column boundary candidate.
- *
- * This is the key strategy for detecting columns in layouts like textbooks
- * where the gutter between columns might be quite narrow (e.g. 20-30px)
- * but is still clearly larger than the normal inter-word spacing (5-8px).
- *
- * By comparing gaps RELATIVE to each other rather than against an absolute
- * threshold, this approach works at any scale, resolution, or font size.
- */
-function detectColumnsViaRelativeGaps(
-  lines: OcrToken[][],
-  metrics: LayoutMetrics,
-  pageBounds: OcrBoundingBox
-): ColumnRegion[] {
-  const candidates: GutterCandidate[] = [];
-
-  for (const line of lines) {
-    const sorted = [...line].sort((a, b) => a.bbox.x - b.bbox.x);
-    if (sorted.length < 3) continue; // Need 2+ gaps to compare
-
-    // Compute all inter-token gaps in this line
-    const gaps: Array<{ gap: number; left: number; right: number }> = [];
-    for (let i = 1; i < sorted.length; i++) {
-      const prevRight = sorted[i - 1].bbox.x + sorted[i - 1].bbox.width;
-      const currLeft = sorted[i].bbox.x;
-      const gap = currLeft - prevRight;
-      if (gap > 0) {
-        gaps.push({ gap, left: prevRight, right: currLeft });
-      }
-    }
-
-    if (gaps.length < 2) continue;
-
-    // Find the median gap (typical word spacing for THIS line)
-    const sortedGaps = gaps.map((g) => g.gap).sort((a, b) => a - b);
-    const medianGap = sortedGaps[Math.floor(sortedGaps.length / 2)];
-
-    if (medianGap <= 0) continue;
-
-    // Find the largest gap and check if it's much bigger than the median
-    const maxGapEntry = gaps.reduce(
-      (best, entry) => (entry.gap > best.gap ? entry : best),
-      gaps[0]
-    );
-
-    // The gap must be RELATIVE_GAP_FACTOR times the median AND have
-    // a minimum absolute size (to avoid noise in very tight text)
-    if (
-      maxGapEntry.gap >= medianGap * RELATIVE_GAP_FACTOR &&
-      maxGapEntry.gap >= Math.max(6, metrics.medianWordGap * 1.5)
-    ) {
-      candidates.push({
-        left: maxGapEntry.left,
-        right: maxGapEntry.right,
-        centerX: (maxGapEntry.left + maxGapEntry.right) / 2,
-      });
-    }
-  }
-
-  if (candidates.length === 0) return [];
-
-  // Cluster and validate
-  const gutters = clusterGutters(candidates, metrics);
-
-  const stableGutters = gutters.filter(
-    (g) =>
-      g.lineCount / lines.length >= MIN_GUTTER_LINES_RATIO &&
-      g.lineCount >= MIN_GUTTER_LINE_COUNT
-  );
-
-  if (stableGutters.length === 0) return [];
-
-  return buildColumnRegions(stableGutters, pageBounds);
-}
-
-// ─── Strategy 3: Histogram Detection ──────────────────────────────────────────
-
-/**
- * Divide the X-axis into bins and count how many tokens cover each bin.
- * Empty or near-empty vertical strips that run through the page are gutters.
- */
-function detectColumnsViaHistogram(
-  lines: OcrToken[][],
-  metrics: LayoutMetrics,
-  pageBounds: OcrBoundingBox
-): ColumnRegion[] {
-  const allTokens = lines.flat();
-  // Histogram needs meaningful amounts of data to avoid false positives
-  if (allTokens.length < 8 || lines.length < 3) return [];
-
-  // Use fine bins for good resolution
-  const binCount = Math.max(50, Math.min(300, Math.round(metrics.pageWidth / 2)));
-  const binWidth = metrics.pageWidth / binCount;
-  const bins = new Float32Array(binCount);
-
-  for (const token of allTokens) {
-    const tokenLeft = token.bbox.x - pageBounds.x;
-    const tokenRight = tokenLeft + token.bbox.width;
-    const startBin = Math.max(0, Math.floor(tokenLeft / binWidth));
-    const endBin = Math.min(binCount - 1, Math.floor(tokenRight / binWidth));
-
-    for (let b = startBin; b <= endBin; b++) {
-      bins[b] += 1;
-    }
-  }
-
-  let maxDensity = 0;
-  for (let b = 0; b < binCount; b++) {
-    maxDensity = Math.max(maxDensity, bins[b]);
-  }
-
-  if (maxDensity < 2) return [];
-
-  // Look for empty/near-empty strips (density <= 5% of max),
-  // in the middle 80% of the page (margins excluded)
-  const marginBins = Math.floor(binCount * 0.1);
-  const emptyThreshold = maxDensity * 0.05;
-
-  // Minimum gutter width: just enough to not detect inter-character gaps
-  // Use 1% of page width or 6px, whichever is larger
-  const minGutterWidth = Math.max(6, metrics.pageWidth * 0.01);
-
-  const emptyStrips: Array<{ startBin: number; endBin: number }> = [];
-  let stripStart: number | null = null;
-
-  for (let b = marginBins; b < binCount - marginBins; b++) {
-    if (bins[b] <= emptyThreshold) {
-      if (stripStart === null) stripStart = b;
-    } else {
-      if (stripStart !== null) {
-        const stripWidth = (b - stripStart) * binWidth;
-        if (stripWidth >= minGutterWidth) {
-          emptyStrips.push({ startBin: stripStart, endBin: b - 1 });
-        }
-        stripStart = null;
-      }
-    }
-  }
-
-  if (stripStart !== null) {
-    const endB = binCount - marginBins - 1;
-    const stripWidth = (endB - stripStart + 1) * binWidth;
-    if (stripWidth >= minGutterWidth) {
-      emptyStrips.push({ startBin: stripStart, endBin: endB });
-    }
-  }
-
-  if (emptyStrips.length === 0) return [];
-
-  // Verify each empty strip has substantial content on BOTH sides
-  const verifiedGutters: GutterCluster[] = [];
-
-  for (const strip of emptyStrips) {
-    const gutterLeft = pageBounds.x + strip.startBin * binWidth;
-    const gutterRight = pageBounds.x + (strip.endBin + 1) * binWidth;
-    const gutterCenter = (gutterLeft + gutterRight) / 2;
-
-    let linesWithBothSides = 0;
-    for (const line of lines) {
-      const hasLeft = line.some(
-        (t) => t.bbox.x + t.bbox.width < gutterCenter && t.bbox.x + t.bbox.width > pageBounds.x
-      );
-      const hasRight = line.some(
-        (t) => t.bbox.x > gutterCenter && t.bbox.x < pageBounds.x + pageBounds.width
-      );
-      if (hasLeft && hasRight) linesWithBothSides++;
-    }
-
-    if (linesWithBothSides >= Math.max(MIN_GUTTER_LINE_COUNT, lines.length * MIN_GUTTER_LINES_RATIO)) {
-      verifiedGutters.push({
-        left: gutterLeft,
-        right: gutterRight,
-        centerX: gutterCenter,
-        lineCount: linesWithBothSides,
-      });
-    }
-  }
-
-  if (verifiedGutters.length === 0) return [];
-
-  return buildColumnRegions(verifiedGutters, pageBounds);
-}
-
-// ─── Shared: Clustering & Region Building ─────────────────────────────────────
-
-function clusterGutters(
-  candidates: GutterCandidate[],
+function clusterSegmentsIntoBlocks(
+  segments: LineSegment[],
   metrics: LayoutMetrics
-): GutterCluster[] {
-  if (candidates.length === 0) return [];
+): OcrToken[][] {
+  if (segments.length === 0) return [];
 
-  // Clustering tolerance: use a generous fraction of page width
-  const clusterTolerance = Math.max(
-    metrics.gutterThreshold,
-    metrics.pageWidth * 0.05
-  );
+  // Union-Find with path compression
+  const parent = segments.map((_, i) => i);
 
-  const sorted = [...candidates].sort((a, b) => a.centerX - b.centerX);
-  const clusters: GutterCluster[] = [];
-
-  for (const candidate of sorted) {
-    const matching = clusters.find(
-      (c) => Math.abs(c.centerX - candidate.centerX) <= clusterTolerance
-    );
-
-    if (matching) {
-      const newCount = matching.lineCount + 1;
-      matching.left =
-        (matching.left * matching.lineCount + candidate.left) / newCount;
-      matching.right =
-        (matching.right * matching.lineCount + candidate.right) / newCount;
-      matching.centerX =
-        (matching.centerX * matching.lineCount + candidate.centerX) / newCount;
-      matching.lineCount = newCount;
-    } else {
-      clusters.push({
-        left: candidate.left,
-        right: candidate.right,
-        centerX: candidate.centerX,
-        lineCount: 1,
-      });
-    }
+  function find(x: number): number {
+    if (parent[x] !== x) parent[x] = find(parent[x]);
+    return parent[x];
   }
 
-  return clusters;
-}
-
-function buildColumnRegions(
-  gutters: GutterCluster[],
-  pageBounds: OcrBoundingBox
-): ColumnRegion[] {
-  const sorted = [...gutters].sort((a, b) => a.centerX - b.centerX);
-  const regions: ColumnRegion[] = [];
-  let cursor = pageBounds.x;
-
-  for (let i = 0; i < sorted.length; i++) {
-    const gutter = sorted[i];
-    if (gutter.left > cursor) {
-      regions.push({
-        left: cursor,
-        right: gutter.left,
-        index: regions.length,
-      });
-    }
-    cursor = gutter.right;
+  function union(x: number, y: number): void {
+    const rx = find(x);
+    const ry = find(y);
+    if (rx !== ry) parent[rx] = ry;
   }
 
-  const pageRight = pageBounds.x + pageBounds.width;
-  if (pageRight > cursor) {
-    regions.push({
-      left: cursor,
-      right: pageRight,
-      index: regions.length,
-    });
-  }
+  const maxVertDist = metrics.medianHeight * 4;
 
-  // Filter out regions narrower than 5% of page width
-  const minColumnWidth = pageBounds.width * 0.05;
-  const validRegions = regions.filter((r) => r.right - r.left >= minColumnWidth);
+  for (let i = 0; i < segments.length; i++) {
+    for (let j = i + 1; j < segments.length; j++) {
+      const a = segments[i];
+      const b = segments[j];
 
-  return validRegions.length >= 2
-    ? validRegions.map((r, i) => ({ ...r, index: i }))
-    : [];
-}
+      // Never merge segments from the same line
+      if (a.lineIndex === b.lineIndex) continue;
 
-// ─── Reading Group Extraction ─────────────────────────────────────────────────
+      // Must be vertically close
+      const vertDist = Math.abs(a.centerY - b.centerY);
+      if (vertDist > maxVertDist) continue;
 
-/**
- * For each band, detect columns and produce reading groups.
- * Reading order: within each band, read each column fully top-to-bottom,
- * left-to-right.
- *
- * If direct column detection fails, it tries sidebar zone detection:
- * clustering line-start X positions to find zones where a sidebar exists
- * alongside body text. The band is then split into sub-bands so column
- * detection works on the smaller, more consistent sub-band.
- */
-function extractReadingGroups(
-  bands: HorizontalBand[],
-  metrics: LayoutMetrics,
-  pageBounds: OcrBoundingBox
-): ReadingGroup[] {
-  const groups: ReadingGroup[] = [];
+      // Must overlap horizontally by at least 20%
+      const overlapLeft = Math.max(a.leftX, b.leftX);
+      const overlapRight = Math.min(a.rightX, b.rightX);
+      const overlapWidth = Math.max(0, overlapRight - overlapLeft);
 
-  for (let bandIndex = 0; bandIndex < bands.length; bandIndex++) {
-    const band = bands[bandIndex];
-    const bandTokens = band.lines.flat();
-    if (bandTokens.length === 0) continue;
-
-    const bandBounds = getBounds(bandTokens);
-
-    if (band.isHeading) {
-      groups.push({
-        tokens: bandTokens,
-        bbox: bandBounds,
-        layoutRole: 'heading',
-        bandIndex,
-        columnIndex: 0,
-      });
-      continue;
-    }
-
-    // Try regular column detection first
-    const columnRegions = detectColumnsInLines(band.lines, metrics, pageBounds);
-
-    if (columnRegions.length >= 2) {
-      assignTokensToColumns(bandTokens, columnRegions, groups, bandIndex);
-      continue;
-    }
-
-    // Regular detection failed. Try sidebar zone detection:
-    // split the band into sub-bands based on line-start X clustering.
-    const subBands = detectSidebarSubBands(band.lines, metrics, pageBounds);
-
-    if (subBands) {
-      for (const subBand of subBands) {
-        const subTokens = subBand.flat();
-        if (subTokens.length === 0) continue;
-
-        const subColumns = detectColumnsInLines(subBand, metrics, pageBounds);
-
-        if (subColumns.length >= 2) {
-          assignTokensToColumns(subTokens, subColumns, groups, bandIndex);
-        } else {
-          groups.push({
-            tokens: subTokens,
-            bbox: getBounds(subTokens),
-            layoutRole: 'flow',
-            bandIndex,
-            columnIndex: 0,
-          });
-        }
+      const minSegWidth = Math.min(a.rightX - a.leftX, b.rightX - b.leftX);
+      if (minSegWidth > 0 && overlapWidth >= minSegWidth * 0.20) {
+        union(i, j);
       }
-      continue;
-    }
-
-    // Truly single column
-    groups.push({
-      tokens: bandTokens,
-      bbox: bandBounds,
-      layoutRole: 'flow',
-      bandIndex,
-      columnIndex: 0,
-    });
-  }
-
-  return groups;
-}
-
-/**
- * Assigns tokens to column regions and pushes reading groups.
- */
-function assignTokensToColumns(
-  tokens: OcrToken[],
-  columnRegions: ColumnRegion[],
-  groups: ReadingGroup[],
-  bandIndex: number
-): void {
-  const columnTokens: Map<number, OcrToken[]> = new Map();
-  for (const region of columnRegions) {
-    columnTokens.set(region.index, []);
-  }
-
-  for (const token of tokens) {
-    const bestRegion = findBestColumnRegion(token, columnRegions);
-    if (bestRegion !== null) {
-      columnTokens.get(bestRegion.index)!.push(token);
     }
   }
 
-  // Produce groups in column order (left to right), each read top-to-bottom
-  for (const region of columnRegions) {
-    const regionTokens = columnTokens.get(region.index) ?? [];
-    if (regionTokens.length === 0) continue;
-
-    groups.push({
-      tokens: regionTokens,
-      bbox: getBounds(regionTokens),
-      layoutRole: 'side',
-      bandIndex,
-      columnIndex: region.index,
-    });
+  // Collect blocks
+  const blockMap = new Map<number, OcrToken[]>();
+  for (let i = 0; i < segments.length; i++) {
+    const root = find(i);
+    if (!blockMap.has(root)) blockMap.set(root, []);
+    blockMap.get(root)!.push(...segments[i].tokens);
   }
+
+  return [...blockMap.values()];
 }
 
-// ─── Sidebar Zone Detection ───────────────────────────────────────────────────
+// ─── Step 3: Layout Role Assignment ───────────────────────────────────────────
 
 /**
- * Strategy 4: Left-Edge Clustering for Sidebar Detection
- *
- * When a sidebar (figure caption, annotation) only spans PART of the page
- * height, the regular column detection fails because the gutter doesn't
- * appear in enough lines. This function detects sidebar zones by looking
- * at WHERE each line starts (leftmost token X).
- *
- * If some lines start at x≈10 (sidebar) and others start at x≈200 (body),
- * there are two distinct clusters of start positions. The sidebar cluster's
- * Y range tells us where the multi-column zone is.
- *
- * Returns sub-bands (groups of lines) that can be independently analyzed
- * for column structure, or null if no sidebar zone is detected.
+ * Assigns layout roles to each block:
+ *   • 'heading' — small, isolated blocks (few words, vertically separated)
+ *   • 'side'    — blocks that share their Y range with another block
+ *   • 'flow'    — everything else (single-column body text)
  */
-function detectSidebarSubBands(
-  lines: OcrToken[][],
+function assignLayoutRoles(
+  blocks: OcrToken[][],
   metrics: LayoutMetrics,
   pageBounds: OcrBoundingBox
-): OcrToken[][][] | null {
-  if (lines.length < 4) return null;
+): SpatialBlock[] {
+  const categorized: SpatialBlock[] = blocks.map((tokens) => ({
+    tokens,
+    bbox: getBounds(tokens),
+    layoutRole: 'flow' as OcrLayoutRole,
+  }));
 
-  // Collect leftmost X and center Y for each line
-  const lineInfos = lines.map((line, idx) => {
-    const sorted = [...line].sort((a, b) => a.bbox.x - b.bbox.x);
-    const bounds = getBounds(line);
-    return {
-      leftX: sorted[0].bbox.x,
-      centerY: bounds.y + bounds.height / 2,
-      index: idx,
-    };
-  });
+  // Detect headings
+  for (const block of categorized) {
+    const wordCount = block.tokens.reduce((count, token) => {
+      return count + token.text.split(/\s+/).filter(Boolean).length;
+    }, 0);
 
-  // Sort by leftX and find the largest gap
-  const sortedByX = [...lineInfos].sort((a, b) => a.leftX - b.leftX);
-  let maxGap = 0;
-  let gapIndex = -1;
+    if (wordCount > HEADING_MAX_WORDS) continue;
 
-  for (let i = 1; i < sortedByX.length; i++) {
-    const gap = sortedByX[i].leftX - sortedByX[i - 1].leftX;
-    if (gap > maxGap) {
-      maxGap = gap;
-      gapIndex = i;
+    const widthRatio = block.bbox.width / Math.max(pageBounds.width, 1);
+    if (widthRatio >= HEADING_MAX_WIDTH_RATIO) continue;
+
+    // Check vertical isolation
+    let minGap = Infinity;
+    for (const other of categorized) {
+      if (other === block) continue;
+      minGap = Math.min(minGap, verticalGapBetween(block.bbox, other.bbox));
+    }
+
+    if (minGap > metrics.medianHeight * 1.5) {
+      block.layoutRole = 'heading';
     }
   }
 
-  // The gap must be significant: at least 10% of page width
-  if (maxGap < pageBounds.width * 0.10 || gapIndex < 0) return null;
+  // Detect side columns: blocks that share Y range with another non-heading block
+  for (const block of categorized) {
+    if (block.layoutRole === 'heading') continue;
 
-  // Split into two groups
-  const splitX = (sortedByX[gapIndex - 1].leftX + sortedByX[gapIndex].leftX) / 2;
-  const leftGroup = lineInfos.filter((li) => li.leftX < splitX);
-  const rightGroup = lineInfos.filter((li) => li.leftX >= splitX);
+    const hasSibling = categorized.some((other) => {
+      if (other === block || other.layoutRole === 'heading') return false;
+      // Check vertical overlap
+      const overlapTop = Math.max(block.bbox.y, other.bbox.y);
+      const overlapBottom = Math.min(
+        block.bbox.y + block.bbox.height,
+        other.bbox.y + other.bbox.height
+      );
+      return overlapBottom > overlapTop;
+    });
 
-  // Each group must have at least 2 lines
-  if (leftGroup.length < 2 || rightGroup.length < 2) return null;
-
-  // The sidebar is the MINORITY group (fewer lines)
-  const sidebarGroup = leftGroup.length <= rightGroup.length ? leftGroup : rightGroup;
-
-  // Find the sidebar's vertical extent
-  const sidebarYMin = Math.min(...sidebarGroup.map((g) => g.centerY)) - metrics.medianHeight * 3;
-  const sidebarYMax = Math.max(...sidebarGroup.map((g) => g.centerY)) + metrics.medianHeight * 3;
-
-  // Split lines into sub-bands: above sidebar, sidebar zone, below sidebar
-  const aboveLines: OcrToken[][] = [];
-  const sidebarLines: OcrToken[][] = [];
-  const belowLines: OcrToken[][] = [];
-
-  for (const line of lines) {
-    const bounds = getBounds(line);
-    const centerY = bounds.y + bounds.height / 2;
-
-    if (centerY < sidebarYMin) {
-      aboveLines.push(line);
-    } else if (centerY > sidebarYMax) {
-      belowLines.push(line);
-    } else {
-      sidebarLines.push(line);
+    if (hasSibling) {
+      block.layoutRole = 'side';
     }
   }
 
-  // The sidebar zone must have enough lines for column detection
-  if (sidebarLines.length < 2) return null;
-
-  // Build sub-bands (skip empty ones)
-  const subBands: OcrToken[][][] = [];
-  if (aboveLines.length > 0) subBands.push(aboveLines);
-  if (sidebarLines.length > 0) subBands.push(sidebarLines);
-  if (belowLines.length > 0) subBands.push(belowLines);
-
-  // Only useful if we actually split the band
-  return subBands.length > 1 ? subBands : null;
+  return categorized;
 }
 
+// ─── Step 4: Block Sorting ────────────────────────────────────────────────────
+
 /**
- * Assigns a token to the column region it overlaps with the most.
+ * Sorts blocks in reading order:
+ *   - Top-to-bottom (by row)
+ *   - Left-to-right within each row
+ *
+ * Two blocks are in the same "row" if their top Y positions are within
+ * 3x the median line height.
  */
-function findBestColumnRegion(
-  token: OcrToken,
-  regions: ColumnRegion[]
-): ColumnRegion | null {
-  let bestRegion: ColumnRegion | null = null;
-  let bestOverlap = 0;
-
-  for (const region of regions) {
-    const overlap = overlapWidth(
-      token.bbox,
-      { x: region.left, y: 0, width: region.right - region.left, height: 1 }
-    );
-    const ratio = overlap / Math.max(token.bbox.width, 1);
-
-    if (ratio > bestOverlap) {
-      bestOverlap = ratio;
-      bestRegion = region;
-    }
-  }
-
-  return bestRegion;
+function sortBlocks(blocks: SpatialBlock[], metrics: LayoutMetrics): SpatialBlock[] {
+  return [...blocks].sort((a, b) => {
+    const yDiff = a.bbox.y - b.bbox.y;
+    // If blocks are far apart vertically, sort by Y
+    if (Math.abs(yDiff) > metrics.medianHeight * 3) return yDiff;
+    // Same row: sort left-to-right
+    return a.bbox.x - b.bbox.x;
+  });
 }
 
 // ─── Token Processing ─────────────────────────────────────────────────────────
@@ -1016,8 +553,4 @@ function verticalGapBetween(a: OcrBoundingBox, b: OcrBoundingBox): number {
   }
 
   return Math.max(0, a.y - (b.y + b.height));
-}
-
-function overlapWidth(a: OcrBoundingBox, b: OcrBoundingBox): number {
-  return Math.max(0, Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x));
 }
