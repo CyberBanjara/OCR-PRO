@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef, type PointerEvent as ReactPointerEvent } from 'react';
 import { useOcrStore } from '@/stores/ocr-store';
 import { db } from '@/lib/db';
 import { loadPdf, renderPageToDataUrl, destroyPdf } from '@/lib/pdf-renderer';
@@ -14,21 +14,78 @@ import { ExportPanel } from '@/components/ExportPanel';
 import { ProjectDashboard } from '@/components/ProjectDashboard';
 import { Button } from '@/components/ui/button';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
-import { Play, Pause, Square, RotateCcw, ChevronLeft, ChevronRight, Home, Eye, Type, ZoomIn, ZoomOut } from 'lucide-react';
-import type { OcrProject, OcrPage } from '@/types/ocr';
+import { Play, Pause, Square, RotateCcw, ChevronLeft, ChevronRight, Home, Eye, Type, ZoomIn, ZoomOut, Volume2, SkipBack, SkipForward } from 'lucide-react';
+import type { OcrColumn, OcrProject, OcrPage } from '@/types/ocr';
 import { motion, AnimatePresence } from 'framer-motion';
 
 type View = 'dashboard' | 'upload' | 'workspace';
 const PREVIEW_SCALE_MIN = 0.8;
 const PREVIEW_SCALE_MAX = 2.4;
 const PREVIEW_SCALE_STEP = 0.2;
+const SIDEBAR_WIDTH_MIN = 88;
+const SIDEBAR_WIDTH_MAX = 240;
+const PUNCTUATION_PAUSE_MS = 2000;
+const DEFAULT_PAUSE_MS = 250;
+
+interface SpeechChunk {
+  text: string;
+  pauseAfter: number;
+  voiceMode: 'body' | 'heading';
+}
 
 export default function OcrApp() {
   const [view, setView] = useState<View>('dashboard');
   const [loading, setLoading] = useState(false);
   const [viewTab, setViewTab] = useState<string>('preview');
   const [previewScale, setPreviewScale] = useState(1.5);
+  const [leftSidebarWidth, setLeftSidebarWidth] = useState(112);
+  const [isAudioPlaying, setIsAudioPlaying] = useState(false);
+  const [isAudioPaused, setIsAudioPaused] = useState(false);
+  const [audioPageNumber, setAudioPageNumber] = useState<number | null>(null);
+  const workspaceRef = useRef<HTMLDivElement>(null);
+  const pagesRef = useRef<OcrPage[]>([]);
+  const currentPageNumberRef = useRef(1);
+  const speechRef = useRef<SpeechSynthesis | null>(null);
+  const bodyVoiceRef = useRef<SpeechSynthesisVoice | null>(null);
+  const headingVoiceRef = useRef<SpeechSynthesisVoice | null>(null);
+  const narrationRunRef = useRef(0);
+  const chunkTimeoutRef = useRef<number | null>(null);
+  const pendingContinuationRef = useRef<(() => void) | null>(null);
   const store = useOcrStore();
+
+  useEffect(() => {
+    pagesRef.current = store.pages;
+    currentPageNumberRef.current = store.currentPageNumber;
+  }, [store.pages, store.currentPageNumber]);
+
+  useEffect(() => {
+    speechRef.current = typeof window !== 'undefined' ? window.speechSynthesis : null;
+    const speech = speechRef.current;
+    if (!speech) return;
+
+    const assignVoice = () => {
+      const voices = speech.getVoices();
+      if (voices.length === 0) return;
+
+      const primary = voices.find((voice) => voice.default)
+        ?? voices.find((voice) => voice.lang?.toLowerCase().startsWith(navigator.language.toLowerCase().slice(0, 2)))
+        ?? voices[0]
+        ?? null;
+
+      const alternate = voices.find((voice) =>
+        primary &&
+        voice.voiceURI !== primary.voiceURI &&
+        voice.lang?.slice(0, 2).toLowerCase() === primary.lang?.slice(0, 2).toLowerCase()
+      ) ?? voices.find((voice) => primary && voice.voiceURI !== primary.voiceURI) ?? primary;
+
+      bodyVoiceRef.current = primary;
+      headingVoiceRef.current = alternate;
+    };
+
+    assignVoice();
+    speech.addEventListener('voiceschanged', assignVoice);
+    return () => speech.removeEventListener('voiceschanged', assignVoice);
+  }, []);
 
   // Load project from dashboard
   const openProject = useCallback(async (project: OcrProject) => {
@@ -136,6 +193,7 @@ export default function OcrApp() {
       onPageComplete: (pageNumber, result) => {
         store.updatePageStatus(pageNumber, 'completed', {
           text: result.text,
+          columns: result.columns,
           confidence: result.confidence,
           processedAt: Date.now(),
           error: null,
@@ -176,7 +234,176 @@ export default function OcrApp() {
     }
   }, [store, startOcr]);
 
+  const findPlayablePage = useCallback((startPageNumber: number, direction: 1 | -1) => {
+    const source = direction === 1 ? pagesRef.current : [...pagesRef.current].reverse();
+    return source.find((page) => (
+      (direction === 1 ? page.pageNumber >= startPageNumber : page.pageNumber <= startPageNumber) &&
+      page.status === 'completed' &&
+      page.text.trim().length > 0
+    )) ?? null;
+  }, []);
+
+  const stopAudio = useCallback(() => {
+    narrationRunRef.current += 1;
+    if (chunkTimeoutRef.current !== null) {
+      window.clearTimeout(chunkTimeoutRef.current);
+      chunkTimeoutRef.current = null;
+    }
+    pendingContinuationRef.current = null;
+    speechRef.current?.cancel();
+    setIsAudioPlaying(false);
+    setIsAudioPaused(false);
+    setAudioPageNumber(null);
+  }, []);
+
+  const speakPage = useCallback((page: OcrPage, runId: number) => {
+    const speech = speechRef.current;
+    if (!speech) return;
+    const chunks = buildSpeechChunks(page);
+    if (chunks.length === 0) {
+      const nextPage = findPlayablePage(page.pageNumber + 1, 1);
+      if (!nextPage) {
+        stopAudio();
+        return;
+      }
+      speakPage(nextPage, runId);
+      return;
+    }
+
+    const speakChunk = (chunkIndex: number) => {
+      if (runId !== narrationRunRef.current) return;
+
+      if (chunkIndex >= chunks.length) {
+        const nextPage = findPlayablePage(page.pageNumber + 1, 1);
+        if (!nextPage) {
+          stopAudio();
+          return;
+        }
+        speakPage(nextPage, runId);
+        return;
+      }
+
+      const chunk = chunks[chunkIndex];
+      const speakWithVoice = (useExplicitVoice: boolean) => {
+        const utterance = new SpeechSynthesisUtterance(chunk.text);
+        const selectedVoice = chunk.voiceMode === 'heading'
+          ? (headingVoiceRef.current ?? bodyVoiceRef.current)
+          : bodyVoiceRef.current;
+
+        if (useExplicitVoice && selectedVoice) {
+          utterance.voice = selectedVoice;
+          utterance.lang = selectedVoice.lang;
+        }
+        utterance.rate = chunk.voiceMode === 'heading' ? 0.92 : 1;
+        utterance.pitch = chunk.voiceMode === 'heading' ? 1.15 : 1;
+        utterance.onstart = () => {
+          if (runId !== narrationRunRef.current) return;
+          setIsAudioPlaying(true);
+          setIsAudioPaused(false);
+          setAudioPageNumber(page.pageNumber);
+          store.setCurrentPage(page.pageNumber);
+        };
+        utterance.onend = () => {
+          if (runId !== narrationRunRef.current) return;
+          const continuePlayback = () => {
+            pendingContinuationRef.current = null;
+            chunkTimeoutRef.current = null;
+            speakChunk(chunkIndex + 1);
+          };
+
+          if (chunk.pauseAfter > 0) {
+            pendingContinuationRef.current = continuePlayback;
+            chunkTimeoutRef.current = window.setTimeout(continuePlayback, chunk.pauseAfter);
+            return;
+          }
+
+          continuePlayback();
+        };
+        utterance.onerror = () => {
+          if (runId !== narrationRunRef.current) return;
+          if (useExplicitVoice && selectedVoice) {
+            speakWithVoice(false);
+            return;
+          }
+          stopAudio();
+        };
+
+        speech.speak(utterance);
+      };
+
+      speakWithVoice(true);
+    };
+
+    speakChunk(0);
+  }, [findPlayablePage, stopAudio, store]);
+
+  const startAudio = useCallback((pageNumber?: number) => {
+    const speech = speechRef.current;
+    if (!speech) return;
+
+    if (pageNumber === undefined && pendingContinuationRef.current && isAudioPlaying) {
+      const continuation = pendingContinuationRef.current;
+      pendingContinuationRef.current = null;
+      if (chunkTimeoutRef.current !== null) {
+        window.clearTimeout(chunkTimeoutRef.current);
+        chunkTimeoutRef.current = null;
+      }
+      setIsAudioPaused(false);
+      continuation();
+      return;
+    }
+
+    if (pageNumber === undefined && speech.paused && isAudioPlaying) {
+      speech.resume();
+      setIsAudioPaused(false);
+      return;
+    }
+
+    const targetStart = pageNumber ?? currentPageNumberRef.current;
+    const page = findPlayablePage(targetStart, 1);
+    if (!page) return;
+
+    narrationRunRef.current += 1;
+    const runId = narrationRunRef.current;
+
+    if (chunkTimeoutRef.current !== null) {
+      window.clearTimeout(chunkTimeoutRef.current);
+      chunkTimeoutRef.current = null;
+    }
+    pendingContinuationRef.current = null;
+    if (speech.speaking || speech.pending) {
+      speech.cancel();
+    }
+    speech.resume();
+    setIsAudioPlaying(true);
+    setIsAudioPaused(false);
+    setAudioPageNumber(page.pageNumber);
+    store.setCurrentPage(page.pageNumber);
+    speakPage(page, runId);
+  }, [findPlayablePage, isAudioPlaying, speakPage, store]);
+
+  const pauseAudio = useCallback(() => {
+    const speech = speechRef.current;
+    if (chunkTimeoutRef.current !== null && pendingContinuationRef.current) {
+      window.clearTimeout(chunkTimeoutRef.current);
+      chunkTimeoutRef.current = null;
+      setIsAudioPaused(true);
+      return;
+    }
+    if (!speech?.speaking) return;
+    speech.pause();
+    setIsAudioPaused(true);
+  }, []);
+
+  const skipAudioPage = useCallback((direction: 1 | -1) => {
+    const basePage = audioPageNumber ?? currentPageNumberRef.current;
+    const targetPage = findPlayablePage(basePage + direction, direction);
+    if (!targetPage) return;
+    startAudio(targetPage.pageNumber);
+  }, [audioPageNumber, findPlayablePage, startAudio]);
+
   const goHome = () => {
+    stopAudio();
     destroyPdf();
     ocrEngine.stop();
     store.setCurrentProject(null);
@@ -186,13 +413,40 @@ export default function OcrApp() {
     setView('dashboard');
   };
 
+  const startSidebarResize = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
+    const workspaceBounds = workspaceRef.current?.getBoundingClientRect();
+    if (!workspaceBounds) return;
+
+    event.preventDefault();
+
+    const updateWidth = (clientX: number) => {
+      const nextWidth = clientX - workspaceBounds.left;
+      setLeftSidebarWidth(Math.min(SIDEBAR_WIDTH_MAX, Math.max(SIDEBAR_WIDTH_MIN, nextWidth)));
+    };
+
+    updateWidth(event.clientX);
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      updateWidth(moveEvent.clientX);
+    };
+
+    const handlePointerUp = () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', handlePointerUp);
+    };
+
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', handlePointerUp, { once: true });
+  }, []);
+
   // Cleanup on unmount
   useEffect(() => {
     return () => {
+      stopAudio();
       destroyPdf();
       ocrEngine.terminate();
     };
-  }, []);
+  }, [stopAudio]);
 
   if (view === 'dashboard') {
     return (
@@ -224,6 +478,7 @@ export default function OcrApp() {
   const currentPage = pages.find(p => p.pageNumber === currentPageNumber);
   const failedCount = pages.filter(p => p.status === 'failed').length;
   const previewZoom = Math.round((previewScale / 1.5) * 100);
+  const audioReady = Boolean(currentPage && currentPage.status === 'completed' && currentPage.text.trim());
 
   return (
     <div className="h-[100dvh] overflow-hidden bg-background flex flex-col">
@@ -273,9 +528,12 @@ export default function OcrApp() {
         </div>
       </header>
 
-      <div className="flex flex-1 min-h-0 overflow-hidden">
+      <div ref={workspaceRef} className="flex flex-1 min-h-0 overflow-hidden">
         {/* Page sidebar */}
-        <aside className="w-28 border-r border-border/70 bg-card/40 overflow-y-auto overscroll-contain p-2.5 flex flex-col gap-2 shrink-0">
+        <aside
+          className="border-r border-border/70 bg-card/40 overflow-y-auto overscroll-contain p-2.5 flex flex-col gap-2 shrink-0"
+          style={{ width: `${leftSidebarWidth}px` }}
+        >
           {pages.map(page => (
             <PageThumbnail
               key={page.id}
@@ -288,6 +546,16 @@ export default function OcrApp() {
             />
           ))}
         </aside>
+
+        <button
+          type="button"
+          aria-label="Resize page sidebar"
+          onPointerDown={startSidebarResize}
+          className="group relative hidden w-3 shrink-0 cursor-col-resize border-r border-border/50 bg-transparent lg:block"
+        >
+          <span className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-border/70 transition-colors group-hover:bg-primary group-active:bg-primary" />
+          <span className="absolute left-1/2 top-1/2 h-12 w-1.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-border/80 transition-colors group-hover:bg-primary/70 group-active:bg-primary" />
+        </button>
 
         {/* Main content */}
         <main className="flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden bg-[linear-gradient(180deg,hsl(var(--background)),hsl(var(--surface-sunken)))]">
@@ -348,32 +616,73 @@ export default function OcrApp() {
                 </TabsList>
 
                 {viewTab === 'preview' && (
-                  <div className="glass flex items-center gap-2 rounded-full border border-border/60 px-2 py-1.5">
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      className="h-8 rounded-full px-3 text-xs"
-                      disabled={previewScale <= PREVIEW_SCALE_MIN}
-                      onClick={() => setPreviewScale((current) => Math.max(PREVIEW_SCALE_MIN, current - PREVIEW_SCALE_STEP))}
-                    >
-                      <ZoomOut className="w-3.5 h-3.5" />
-                      Minimize
-                    </Button>
-                    <span className="min-w-14 text-center text-xs font-mono text-muted-foreground">
-                      {previewZoom}%
-                    </span>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      className="h-8 rounded-full px-3 text-xs"
-                      disabled={previewScale >= PREVIEW_SCALE_MAX}
-                      onClick={() => setPreviewScale((current) => Math.min(PREVIEW_SCALE_MAX, current + PREVIEW_SCALE_STEP))}
-                    >
-                      <ZoomIn className="w-3.5 h-3.5" />
-                      Maximize
-                    </Button>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="glass flex items-center gap-2 rounded-full border border-border/60 px-2 py-1.5">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="h-8 w-8 rounded-full p-0"
+                        disabled={!audioReady && audioPageNumber === null}
+                        onClick={() => skipAudioPage(-1)}
+                      >
+                        <SkipBack className="w-3.5 h-3.5" />
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="h-8 rounded-full px-3 text-xs"
+                        disabled={!audioReady}
+                        onClick={isAudioPlaying && !isAudioPaused ? pauseAudio : () => startAudio()}
+                      >
+                        {isAudioPlaying && !isAudioPaused ? <Pause className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
+                        {isAudioPlaying && !isAudioPaused ? 'Pause Audio' : isAudioPaused ? 'Resume Audio' : 'Play Audio'}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="h-8 w-8 rounded-full p-0"
+                        disabled={!audioReady && audioPageNumber === null}
+                        onClick={() => skipAudioPage(1)}
+                      >
+                        <SkipForward className="w-3.5 h-3.5" />
+                      </Button>
+                      {audioPageNumber && (
+                        <span className="text-xs text-muted-foreground">
+                          Page {audioPageNumber}
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="glass flex items-center gap-2 rounded-full border border-border/60 px-2 py-1.5">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="h-8 rounded-full px-3 text-xs"
+                        disabled={previewScale <= PREVIEW_SCALE_MIN}
+                        onClick={() => setPreviewScale((current) => Math.max(PREVIEW_SCALE_MIN, current - PREVIEW_SCALE_STEP))}
+                      >
+                        <ZoomOut className="w-3.5 h-3.5" />
+                        Minimize
+                      </Button>
+                      <span className="min-w-14 text-center text-xs font-mono text-muted-foreground">
+                        {previewZoom}%
+                      </span>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="h-8 rounded-full px-3 text-xs"
+                        disabled={previewScale >= PREVIEW_SCALE_MAX}
+                        onClick={() => setPreviewScale((current) => Math.min(PREVIEW_SCALE_MAX, current + PREVIEW_SCALE_STEP))}
+                      >
+                        <ZoomIn className="w-3.5 h-3.5" />
+                        Maximize
+                      </Button>
+                    </div>
                   </div>
                 )}
               </div>
@@ -409,4 +718,36 @@ export default function OcrApp() {
       </div>
     </div>
   );
+}
+
+function buildSpeechChunks(page: OcrPage): SpeechChunk[] {
+  const orderedColumns = page.columns.length > 0
+    ? [...page.columns].sort((a, b) => a.index - b.index)
+    : [];
+
+  if (orderedColumns.length > 0) {
+    const columnChunks = orderedColumns.flatMap((column) => columnToSpeechChunks(column));
+    if (columnChunks.length > 0) {
+      return columnChunks;
+    }
+  }
+
+  return splitTextIntoSpeechChunks(page.text, 'body');
+}
+
+function columnToSpeechChunks(column: OcrColumn): SpeechChunk[] {
+  const role = column.layoutRole === 'heading' ? 'heading' : 'body';
+  return splitTextIntoSpeechChunks(column.text, role);
+}
+
+function splitTextIntoSpeechChunks(text: string, voiceMode: 'body' | 'heading'): SpeechChunk[] {
+  return text
+    .split(/(?<=[,.;:!?])\s+|\n+/)
+    .map((chunk) => chunk.trim())
+    .filter(Boolean)
+    .map((chunk) => ({
+      text: chunk,
+      voiceMode,
+      pauseAfter: /[,.!?;:]$/.test(chunk) ? PUNCTUATION_PAUSE_MS : DEFAULT_PAUSE_MS,
+    }));
 }
