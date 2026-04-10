@@ -686,6 +686,11 @@ function buildColumnRegions(
  * For each band, detect columns and produce reading groups.
  * Reading order: within each band, read each column fully top-to-bottom,
  * left-to-right.
+ *
+ * If direct column detection fails, it tries sidebar zone detection:
+ * clustering line-start X positions to find zones where a sidebar exists
+ * alongside body text. The band is then split into sub-bands so column
+ * detection works on the smaller, more consistent sub-band.
  */
 function extractReadingGroups(
   bands: HorizontalBand[],
@@ -712,48 +717,184 @@ function extractReadingGroups(
       continue;
     }
 
-    // Detect columns within this band
+    // Try regular column detection first
     const columnRegions = detectColumnsInLines(band.lines, metrics, pageBounds);
 
-    if (columnRegions.length < 2) {
-      groups.push({
-        tokens: bandTokens,
-        bbox: bandBounds,
-        layoutRole: 'flow',
-        bandIndex,
-        columnIndex: 0,
-      });
-    } else {
-      // Multi-column band: assign each token to its best-matching column
-      const columnTokens: Map<number, OcrToken[]> = new Map();
-      for (const region of columnRegions) {
-        columnTokens.set(region.index, []);
-      }
+    if (columnRegions.length >= 2) {
+      assignTokensToColumns(bandTokens, columnRegions, groups, bandIndex);
+      continue;
+    }
 
-      for (const token of bandTokens) {
-        const bestRegion = findBestColumnRegion(token, columnRegions);
-        if (bestRegion !== null) {
-          columnTokens.get(bestRegion.index)!.push(token);
+    // Regular detection failed. Try sidebar zone detection:
+    // split the band into sub-bands based on line-start X clustering.
+    const subBands = detectSidebarSubBands(band.lines, metrics, pageBounds);
+
+    if (subBands) {
+      for (const subBand of subBands) {
+        const subTokens = subBand.flat();
+        if (subTokens.length === 0) continue;
+
+        const subColumns = detectColumnsInLines(subBand, metrics, pageBounds);
+
+        if (subColumns.length >= 2) {
+          assignTokensToColumns(subTokens, subColumns, groups, bandIndex);
+        } else {
+          groups.push({
+            tokens: subTokens,
+            bbox: getBounds(subTokens),
+            layoutRole: 'flow',
+            bandIndex,
+            columnIndex: 0,
+          });
         }
       }
-
-      // Produce groups in column order (left to right), each read top-to-bottom
-      for (const region of columnRegions) {
-        const tokens = columnTokens.get(region.index) ?? [];
-        if (tokens.length === 0) continue;
-
-        groups.push({
-          tokens,
-          bbox: getBounds(tokens),
-          layoutRole: 'side',
-          bandIndex,
-          columnIndex: region.index,
-        });
-      }
+      continue;
     }
+
+    // Truly single column
+    groups.push({
+      tokens: bandTokens,
+      bbox: bandBounds,
+      layoutRole: 'flow',
+      bandIndex,
+      columnIndex: 0,
+    });
   }
 
   return groups;
+}
+
+/**
+ * Assigns tokens to column regions and pushes reading groups.
+ */
+function assignTokensToColumns(
+  tokens: OcrToken[],
+  columnRegions: ColumnRegion[],
+  groups: ReadingGroup[],
+  bandIndex: number
+): void {
+  const columnTokens: Map<number, OcrToken[]> = new Map();
+  for (const region of columnRegions) {
+    columnTokens.set(region.index, []);
+  }
+
+  for (const token of tokens) {
+    const bestRegion = findBestColumnRegion(token, columnRegions);
+    if (bestRegion !== null) {
+      columnTokens.get(bestRegion.index)!.push(token);
+    }
+  }
+
+  // Produce groups in column order (left to right), each read top-to-bottom
+  for (const region of columnRegions) {
+    const regionTokens = columnTokens.get(region.index) ?? [];
+    if (regionTokens.length === 0) continue;
+
+    groups.push({
+      tokens: regionTokens,
+      bbox: getBounds(regionTokens),
+      layoutRole: 'side',
+      bandIndex,
+      columnIndex: region.index,
+    });
+  }
+}
+
+// ─── Sidebar Zone Detection ───────────────────────────────────────────────────
+
+/**
+ * Strategy 4: Left-Edge Clustering for Sidebar Detection
+ *
+ * When a sidebar (figure caption, annotation) only spans PART of the page
+ * height, the regular column detection fails because the gutter doesn't
+ * appear in enough lines. This function detects sidebar zones by looking
+ * at WHERE each line starts (leftmost token X).
+ *
+ * If some lines start at x≈10 (sidebar) and others start at x≈200 (body),
+ * there are two distinct clusters of start positions. The sidebar cluster's
+ * Y range tells us where the multi-column zone is.
+ *
+ * Returns sub-bands (groups of lines) that can be independently analyzed
+ * for column structure, or null if no sidebar zone is detected.
+ */
+function detectSidebarSubBands(
+  lines: OcrToken[][],
+  metrics: LayoutMetrics,
+  pageBounds: OcrBoundingBox
+): OcrToken[][][] | null {
+  if (lines.length < 4) return null;
+
+  // Collect leftmost X and center Y for each line
+  const lineInfos = lines.map((line, idx) => {
+    const sorted = [...line].sort((a, b) => a.bbox.x - b.bbox.x);
+    const bounds = getBounds(line);
+    return {
+      leftX: sorted[0].bbox.x,
+      centerY: bounds.y + bounds.height / 2,
+      index: idx,
+    };
+  });
+
+  // Sort by leftX and find the largest gap
+  const sortedByX = [...lineInfos].sort((a, b) => a.leftX - b.leftX);
+  let maxGap = 0;
+  let gapIndex = -1;
+
+  for (let i = 1; i < sortedByX.length; i++) {
+    const gap = sortedByX[i].leftX - sortedByX[i - 1].leftX;
+    if (gap > maxGap) {
+      maxGap = gap;
+      gapIndex = i;
+    }
+  }
+
+  // The gap must be significant: at least 10% of page width
+  if (maxGap < pageBounds.width * 0.10 || gapIndex < 0) return null;
+
+  // Split into two groups
+  const splitX = (sortedByX[gapIndex - 1].leftX + sortedByX[gapIndex].leftX) / 2;
+  const leftGroup = lineInfos.filter((li) => li.leftX < splitX);
+  const rightGroup = lineInfos.filter((li) => li.leftX >= splitX);
+
+  // Each group must have at least 2 lines
+  if (leftGroup.length < 2 || rightGroup.length < 2) return null;
+
+  // The sidebar is the MINORITY group (fewer lines)
+  const sidebarGroup = leftGroup.length <= rightGroup.length ? leftGroup : rightGroup;
+
+  // Find the sidebar's vertical extent
+  const sidebarYMin = Math.min(...sidebarGroup.map((g) => g.centerY)) - metrics.medianHeight * 3;
+  const sidebarYMax = Math.max(...sidebarGroup.map((g) => g.centerY)) + metrics.medianHeight * 3;
+
+  // Split lines into sub-bands: above sidebar, sidebar zone, below sidebar
+  const aboveLines: OcrToken[][] = [];
+  const sidebarLines: OcrToken[][] = [];
+  const belowLines: OcrToken[][] = [];
+
+  for (const line of lines) {
+    const bounds = getBounds(line);
+    const centerY = bounds.y + bounds.height / 2;
+
+    if (centerY < sidebarYMin) {
+      aboveLines.push(line);
+    } else if (centerY > sidebarYMax) {
+      belowLines.push(line);
+    } else {
+      sidebarLines.push(line);
+    }
+  }
+
+  // The sidebar zone must have enough lines for column detection
+  if (sidebarLines.length < 2) return null;
+
+  // Build sub-bands (skip empty ones)
+  const subBands: OcrToken[][][] = [];
+  if (aboveLines.length > 0) subBands.push(aboveLines);
+  if (sidebarLines.length > 0) subBands.push(sidebarLines);
+  if (belowLines.length > 0) subBands.push(belowLines);
+
+  // Only useful if we actually split the band
+  return subBands.length > 1 ? subBands : null;
 }
 
 /**

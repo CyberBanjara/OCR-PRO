@@ -148,4 +148,78 @@ describe('buildColumnLayout', () => {
     expect(rightCol.text).not.toContain('Now');
     expect(rightCol.text).not.toContain('Hindi');
   });
+
+  it('detects a sidebar zone that only spans part of the page height', () => {
+    // Simulates Image 2: body text spans full width at top and bottom,
+    // but in the middle there's a figure caption sidebar on the left
+    // while body text continues on the right. The sidebar only occupies
+    // ~4 out of ~12 lines, so regular strategies fail. But the left-edge
+    // clustering detects that some lines start at x≈20 while most start at x≈250.
+    function w(text: string, x: number, y: number, width = 35): OcrToken {
+      return { text, confidence: 95, bbox: { x, y, width, height: 12 } };
+    }
+
+    const layout = buildColumnLayout([
+      // Top zone: body text spanning full width (lines start at x≈250)
+      w('Let', 250, 20), w('us', 290, 20), w('first', 315, 20),
+      w('look', 355, 20), w('at', 395, 20), w('textile', 420, 20, 48),
+      w('production.', 473, 20, 70),
+
+      w('Around', 250, 40), w('1750,', 295, 40), w('before', 340, 40, 42),
+      w('the', 387, 40), w('British', 420, 40, 45),
+      w('conquered', 470, 40, 60),
+
+      w('Bengal,', 250, 60), w('India', 300, 60), w('was', 340, 60),
+      w('by', 380, 60, 15), w('far', 400, 60),
+      w('the', 440, 60), w('largest', 475, 60, 45),
+
+      w('producer', 250, 80), w('of', 300, 80, 12), w('cotton', 317, 80, 42),
+      w('textiles.', 364, 80, 55), w('Indian', 424, 80, 42),
+
+      // Middle zone: sidebar caption on the LEFT + body continues on the RIGHT
+      w('Fig.', 20, 120), w('2', 60, 120, 10), w('-', 75, 120, 8),
+      w('Patola', 88, 120, 42), w('weave,', 135, 120, 38),
+      w('is', 250, 120, 12), w('interesting', 267, 120, 70),
+      w('to', 342, 120, 14), w('trace', 361, 120, 35),
+
+      w('mid-nineteenth', 20, 140, 85), w('century', 110, 140, 48),
+      w('the', 250, 140), w('origin', 290, 140, 40), w('of', 335, 140, 12),
+      w('such', 352, 140, 28), w('words,', 385, 140, 38),
+
+      w('Patola', 20, 160, 42), w('was', 67, 160),
+      w('woven', 105, 160, 38), w('in', 148, 160, 12),
+      w('and', 250, 160), w('see', 290, 160), w('what', 325, 160),
+      w('they', 365, 160), w('tell', 405, 160), w('us.', 445, 160, 18),
+
+      w('Surat,', 20, 180, 40), w('Ahmedabad', 65, 180, 65),
+      w('Words', 250, 180, 42), w('tell', 297, 180),
+      w('us', 337, 180, 14), w('histories', 356, 180, 55),
+
+      // Bottom zone: body text again full width (lines start at x≈250)
+      w('European', 250, 220, 55), w('traders', 310, 220, 44),
+      w('first', 359, 220), w('encountered', 399, 220, 72),
+
+      w('fine', 250, 240), w('cotton', 290, 240, 42), w('cloth', 337, 240),
+      w('from', 377, 240), w('India', 417, 240),
+    ]);
+
+    // Must detect at least the sidebar zone split
+    expect(layout.columns.length).toBeGreaterThanOrEqual(2);
+
+    // Sidebar text (Fig. 2 caption) should NOT be mixed with body text
+    const allText = layout.columns.map(c => c.text).join(' | ');
+    const sidebarCol = layout.columns.find(c => c.text.includes('Patola'));
+    const bodyCol = layout.columns.find(c => c.text.includes('European'));
+
+    expect(sidebarCol).toBeDefined();
+    expect(bodyCol).toBeDefined();
+
+    // Sidebar should have figure caption tokens
+    expect(sidebarCol!.text).toContain('Fig.');
+    expect(sidebarCol!.text).toContain('Patola');
+
+    // Body should not contain sidebar text
+    expect(bodyCol!.text).not.toContain('Fig.');
+    expect(bodyCol!.text).not.toContain('Patola');
+  });
 });
