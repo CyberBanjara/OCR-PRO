@@ -133,6 +133,7 @@ export default function OcrApp() {
         store.updatePageStatus(pageNumber, 'completed', {
           text: result.text,
           confidence: result.confidence,
+          columns: result.columns,
           processedAt: Date.now(),
           error: null,
         });
