@@ -77,11 +77,16 @@ export const OcrTextViewer = forwardRef<HTMLDivElement, OcrTextViewerProps>(func
       </div>
 
       {formattedColumns.length > 1 ? (
-        <div className="grid gap-4 lg:grid-cols-2">
+        <div
+          className="grid gap-4"
+          style={{
+            gridTemplateColumns: `repeat(${Math.min(formattedColumns.length, 3)}, minmax(0, 1fr))`,
+          }}
+        >
           {formattedColumns.map((column) => (
             <section
               key={column.index}
-              className="rounded-lg border border-border bg-surface-sunken p-4"
+              className="rounded-lg border border-border bg-surface-sunken p-4 min-w-0"
             >
               <div className="mb-3 text-xs font-mono text-muted-foreground">
                 Column {column.index}
