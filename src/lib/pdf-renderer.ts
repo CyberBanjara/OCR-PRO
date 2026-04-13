@@ -1,4 +1,5 @@
 import * as pdfjsLib from 'pdfjs-dist';
+import { TextLayer } from 'pdfjs-dist';
 import { buildColumnLayout } from './column-layout';
 import type { OcrColumn, OcrToken } from '@/types/ocr';
 
@@ -71,27 +72,34 @@ export async function renderPageToDataUrl(
   return dataUrl;
 }
 
-export async function renderPageForOcr(pageNumber: number): Promise<ImageData> {
+/**
+ * Renders a PDF.js text layer into a container div, enabling native
+ * text selection on top of the canvas.
+ */
+export async function renderTextLayer(
+  pageNumber: number,
+  container: HTMLDivElement,
+  scale: number = 1.5
+): Promise<void> {
   if (!currentDoc) throw new Error('No PDF loaded');
-  
+
   const page = await currentDoc.getPage(pageNumber);
-  const viewport = page.getViewport({ scale: 2.5 }); // Increased scale for even better OCR decoding
-  
-  const canvas = document.createElement('canvas');
-  canvas.width = viewport.width;
-  canvas.height = viewport.height;
-  
-  const ctx = canvas.getContext('2d');
-  if (!ctx) throw new Error('Cannot get canvas context');
-  
-  await page.render({
-    canvasContext: ctx,
+  const viewport = page.getViewport({ scale });
+  const textContent = await page.getTextContent();
+
+  // Clear previous text layer content
+  container.innerHTML = '';
+  container.style.width = `${viewport.width}px`;
+  container.style.height = `${viewport.height}px`;
+
+  // Use PDF.js TextLayer class (v4.x API)
+  const textLayer = new TextLayer({
+    textContentSource: textContent,
+    container,
     viewport,
-  }).promise;
-  
-  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  canvas.remove();
-  return imageData;
+  });
+
+  await textLayer.render();
 }
 
 export function getPageCount(): number {

@@ -2,7 +2,7 @@ import { useState, useCallback, useEffect, useRef } from 'react';
 import { useOcrStore } from '@/stores/ocr-store';
 import { db } from '@/lib/db';
 import { loadPdf, renderPageToDataUrl, destroyPdf } from '@/lib/pdf-renderer';
-import { ocrEngine } from '@/lib/ocr-engine';
+import { pdfTextEngine } from '@/lib/pdf-text-engine';
 import { computeFileHash } from '@/lib/hash-utils';
 import { FileUpload } from '@/components/FileUpload';
 import { PdfViewer } from '@/components/PdfViewer';
@@ -14,7 +14,7 @@ import { ExportPanel } from '@/components/ExportPanel';
 import { ProjectDashboard } from '@/components/ProjectDashboard';
 import { Button } from '@/components/ui/button';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
-import { Play, Pause, Square, RotateCcw, ChevronLeft, ChevronRight, Home, Eye, Type } from 'lucide-react';
+import { Play, Pause, Square, RotateCcw, ChevronLeft, ChevronRight, Home, Eye, Type, RefreshCw } from 'lucide-react';
 import type { OcrProject, OcrPage } from '@/types/ocr';
 import { motion, AnimatePresence } from 'framer-motion';
 
@@ -122,7 +122,7 @@ export default function OcrApp() {
     store.setProcessing(true);
     store.setPaused(false);
 
-    await ocrEngine.processPages(pendingPages, {
+    await pdfTextEngine.processPages(pendingPages, {
       onPageStart: (pageNumber) => {
         store.updatePageStatus(pageNumber, 'processing');
       },
@@ -148,17 +148,17 @@ export default function OcrApp() {
   }, [store]);
 
   const pauseOcr = () => {
-    ocrEngine.pause();
+    pdfTextEngine.pause();
     store.setPaused(true);
   };
 
   const resumeOcr = () => {
-    ocrEngine.resume();
+    pdfTextEngine.resume();
     store.setPaused(false);
   };
 
   const stopOcr = () => {
-    ocrEngine.stop();
+    pdfTextEngine.stop();
     store.setProcessing(false);
     store.setPaused(false);
   };
@@ -169,13 +169,50 @@ export default function OcrApp() {
     if (!store.isProcessing) {
       startOcr();
     } else {
-      ocrEngine.retryPages(failed.map(p => p.pageNumber));
+      pdfTextEngine.retryPages(failed.map(p => p.pageNumber));
     }
   }, [store, startOcr]);
 
+  // Re-process the current page (reset it to pending → re-run OCR with new thresholds)
+  const reprocessCurrentPage = useCallback(async () => {
+    const { currentPageNumber: pn } = store;
+    // Reset this page to pending so OCR picks it up again
+    store.updatePageStatus(pn, 'pending', {
+      text: '',
+      columns: [],
+      confidence: 0,
+      processedAt: null,
+      error: null,
+    });
+
+    // If not already processing, start a mini OCR run for just this page
+    if (!store.isProcessing) {
+      store.setProcessing(true);
+      store.setPaused(false);
+      await pdfTextEngine.processPages([pn], {
+        onPageStart: (pageNumber) => store.updatePageStatus(pageNumber, 'processing'),
+        onPageProgress: (pageNumber, progress) => store.setPageProgress(pageNumber, progress),
+        onPageComplete: (pageNumber, result) => {
+          store.updatePageStatus(pageNumber, 'completed', {
+            text: result.text,
+            confidence: result.confidence,
+            columns: result.columns,
+            processedAt: Date.now(),
+            error: null,
+          });
+        },
+        onPageError: (pageNumber, error) => store.updatePageStatus(pageNumber, 'failed', { error }),
+        onComplete: () => store.setProcessing(false),
+      });
+    } else {
+      // Already processing — just queue this page
+      pdfTextEngine.retryPages([pn]);
+    }
+  }, [store]);
+
   const goHome = () => {
     destroyPdf();
-    ocrEngine.stop();
+    pdfTextEngine.stop();
     store.setCurrentProject(null);
     store.setPages([]);
     store.setProcessing(false);
@@ -187,7 +224,7 @@ export default function OcrApp() {
   useEffect(() => {
     return () => {
       destroyPdf();
-      ocrEngine.terminate();
+      pdfTextEngine.terminate();
     };
   }, []);
 
@@ -239,7 +276,7 @@ export default function OcrApp() {
           {!isProcessing ? (
             <Button size="sm" onClick={startOcr} className="gradient-primary text-primary-foreground gap-1.5 shadow-glow">
               <Play className="w-3.5 h-3.5" />
-              Start OCR
+              Extract Text
             </Button>
           ) : (
             <>
@@ -323,6 +360,20 @@ export default function OcrApp() {
             >
               <ChevronRight className="w-4 h-4" />
             </Button>
+
+            {/* Re-process current page with updated thresholds */}
+            {currentPage?.status === 'completed' && !isProcessing && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={reprocessCurrentPage}
+                className="gap-1.5 ml-4 text-xs border-primary/30 text-primary hover:bg-primary/10"
+                title="Re-run OCR on this page with current threshold settings"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                Re-process Page
+              </Button>
+            )}
           </div>
 
           {/* Tabs: Preview / Text */}
@@ -335,7 +386,7 @@ export default function OcrApp() {
                 </TabsTrigger>
                 <TabsTrigger value="text" className="gap-1.5 text-xs">
                   <Type className="w-3.5 h-3.5" />
-                  OCR Text
+                  Extracted Text
                 </TabsTrigger>
               </TabsList>
 

@@ -212,3 +212,40 @@
 .ocr-formatted-text {
   white-space: pre-wrap;
 }
+
+/* ─── PDF.js Text Layer ─────────────────────────────────────────────────────
+ * Makes the text layer transparent (invisible) but selectable on top of the
+ * rendered canvas. Users can select/copy text natively.
+ */
+.pdfjs-text-layer {
+  overflow: hidden;
+  line-height: 1;
+  text-size-adjust: none;
+  forced-color-adjust: none;
+  z-index: 2;
+}
+
+.pdfjs-text-layer span,
+.pdfjs-text-layer br {
+  color: transparent;
+  position: absolute;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+}
+
+.pdfjs-text-layer ::selection {
+  background: hsl(var(--primary) / 0.3);
+}
+
+.pdfjs-text-layer .endOfContent {
+  display: block;
+  position: absolute;
+  left: 0;
+  top: 100%;
+  right: 0;
+  bottom: 0;
+  z-index: -1;
+  cursor: default;
+  user-select: none;
+}
