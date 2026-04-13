@@ -340,7 +340,7 @@ function clusterSegmentsIntoBlocks(
 
   // ── Phase 1: Detect column lanes from segment left-edge positions ──
   const laneGapThreshold = Math.max(
-    metrics.pageWidth * 0.08,
+    metrics.pageWidth * 0.18,
     metrics.medianWordGap * 4,
     15
   );
@@ -354,7 +354,7 @@ function clusterSegmentsIntoBlocks(
 
   // ── Phase 2: Within each lane, merge vertically adjacent segments ──
   const blocks: OcrToken[][] = [];
-  const maxVertGap = metrics.medianHeight * 2.5;
+  const maxVertGap = metrics.medianHeight * 7.5;
 
   for (const lane of lanes) {
     if (lane.length === 0) continue;
