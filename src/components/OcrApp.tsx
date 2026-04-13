@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { useOcrStore } from '@/stores/ocr-store';
 import { db } from '@/lib/db';
 import { loadPdf, renderPageToDataUrl, destroyPdf } from '@/lib/pdf-renderer';
@@ -222,9 +222,9 @@ export default function OcrApp() {
   const failedCount = pages.filter(p => p.status === 'failed').length;
 
   return (
-    <div className="min-h-screen bg-background flex flex-col">
+    <div className="h-screen bg-background flex flex-col overflow-hidden">
       {/* Header */}
-      <header className="glass border-b border-border px-4 py-2.5 flex items-center justify-between sticky top-0 z-50">
+      <header className="glass border-b border-border px-4 py-2.5 flex items-center justify-between z-50 shrink-0">
         <div className="flex items-center gap-3">
           <Button variant="ghost" size="sm" onClick={goHome} className="gap-1.5">
             <Home className="w-4 h-4" />
@@ -269,20 +269,28 @@ export default function OcrApp() {
         </div>
       </header>
 
-      <div className="flex flex-1 overflow-hidden">
-        {/* Page sidebar */}
-        <aside className="w-28 border-r border-border bg-card/30 overflow-y-auto p-2 flex flex-col gap-1 shrink-0">
-          {pages.map(page => (
-            <PageThumbnail
-              key={page.id}
-              pageNumber={page.pageNumber}
-              thumbnailUrl={page.thumbnailDataUrl}
-              status={page.status}
-              confidence={page.confidence}
-              isActive={page.pageNumber === currentPageNumber}
-              onClick={() => store.setCurrentPage(page.pageNumber)}
-            />
-          ))}
+      <div className="flex flex-1 min-h-0">
+        {/* Page sidebar — scrolls independently */}
+        <aside className="w-56 border-r border-border bg-card/30 flex flex-col shrink-0">
+          <div className="px-3 py-2.5 border-b border-border/50 shrink-0">
+            <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Pages</h3>
+            <span className="text-[10px] text-muted-foreground font-mono">{pages.length} total</span>
+          </div>
+          <div className="flex-1 overflow-y-auto p-2">
+            <div className="grid grid-cols-2 gap-2">
+              {pages.map(page => (
+                <PageThumbnail
+                  key={page.id}
+                  pageNumber={page.pageNumber}
+                  thumbnailUrl={page.thumbnailDataUrl}
+                  status={page.status}
+                  confidence={page.confidence}
+                  isActive={page.pageNumber === currentPageNumber}
+                  onClick={() => store.setCurrentPage(page.pageNumber)}
+                />
+              ))}
+            </div>
+          </div>
         </aside>
 
         {/* Main content */}
